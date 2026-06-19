@@ -1,0 +1,34 @@
+[package]
+name    = "zcash_tipbot_native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi        = { version = "2.16", features = ["napi4", "async"] }
+napi-derive = "2.16"
+hex         = "0.4"
+thiserror   = "1"
+
+# ── Zcash crates — uncomment when building on Rust ≥ 1.85 ────────────────────
+# These crates require edition 2024 (stable in Rust 1.85+).
+# Run: rustup update stable  (or use the Docker image below)
+#
+# zcash_primitives     = "0.28"
+# zcash_client_backend = "0.23"
+# zcash_keys           = "0.14"
+# zcash_address        = "0.12"
+# orchard              = "0.14"
+# bip0039 = { version = "0.14", features = ["all-languages"] }
+# zip32   = "0.2"
+
+[build-dependencies]
+napi-build = "2.1"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+panic         = "abort"
