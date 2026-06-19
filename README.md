@@ -1,4 +1,4 @@
-# 🛡️ Zcash Ambassador Tipbot
+# 🛡️ Zcash  Tippy bot
 
 A production-ready Telegram tipping bot for Zcash ambassador communities —
 **one bot, added to unlimited groups**, just like Rose, Combot, or other
