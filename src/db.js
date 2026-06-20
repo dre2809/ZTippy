@@ -108,6 +108,17 @@ function migrate() {
   }
 }
 
+// Run migrations immediately on module load — this MUST happen before any
+// of the prepared statements below are defined, since better-sqlite3's
+// db.prepare() validates SQL against the live schema at prepare-time, not
+// at execution-time. If the tables don't exist yet when prepare() runs,
+// it throws "no such table" immediately, even though the query itself
+// would be fine once tables exist.
+//
+// This makes db.migrate() (still exported below) idempotent and safe to
+// call again from bot.js — it's a no-op if migrations already ran here.
+migrate();
+
 // ─── User Queries ─────────────────────────────────────────────────────────────
 
 const userQueries = {
