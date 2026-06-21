@@ -46,8 +46,21 @@ module.exports = {
 
   tips: {
     minZatoshis: parseInt(process.env.MIN_TIP_ZATOSHIS || '10000', 10),
-    maxZatoshis: parseInt(process.env.MAX_TIP_ZATOSHIS || '100000000', 10),
+    // No hard maximum — large tips are allowed, but require explicit
+    // confirmation above the threshold below (whichever is reached first:
+    // a fixed ZEC amount, or a USD-equivalent amount via live price).
+    largeTipZecThreshold: parseFloat(process.env.LARGE_TIP_ZEC_THRESHOLD || '0.05'),
+    largeTipUsdThreshold: parseFloat(process.env.LARGE_TIP_USD_THRESHOLD || '50'),
     rainMaxUsers: parseInt(process.env.RAIN_MAX_USERS || '20', 10),
+  },
+
+  price: {
+    // CoinGecko's public API — no key required for basic price lookups.
+    coingeckoUrl: process.env.COINGECKO_API_URL || 'https://api.coingecko.com/api/v3',
+    // How long a fetched ZEC/USD price is considered fresh before
+    // re-fetching. Keeps the bot well under CoinGecko's free-tier rate
+    // limits even with many simultaneous tips across many groups.
+    cacheTtlSecs: parseInt(process.env.PRICE_CACHE_TTL_SECS || '120', 10),
   },
 
   security: {
