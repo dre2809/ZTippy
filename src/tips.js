@@ -3,6 +3,7 @@
 const db = require('./db');
 const wallet = require('./wallet');
 const config = require('./config');
+const amount = require('./amount');
 const logger = require('./logger');
 
 /**
@@ -64,15 +65,85 @@ function validateTip({ sender, receiver, amountZats, groupId }) {
     return { valid: false, reason: `Minimum tip is ${wallet.formatZec(minTip)}.` };
   }
 
-  if (amountZats > config.tips.maxZatoshis) {
-    return { valid: false, reason: `Maximum tip is ${wallet.formatZec(config.tips.maxZatoshis)}.` };
-  }
-
   if (BigInt(sender.balance_zats) < BigInt(amountZats)) {
     return { valid: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
   }
 
   return { valid: true };
+}
+
+/**
+ * Entry point for /tip — validates the tip and, if it crosses the large-tip
+ * threshold (config.tips.largeTipZecThreshold ZEC OR largeTipUsdThreshold
+ * USD-equivalent, whichever is reached first), stores a pending confirmation
+ * and asks the user to reply YES/NO instead of sending immediately.
+ *
+ * Small tips execute immediately, same as before — confirmation only adds
+ * friction where it matters.
+ */
+async function initiateTip({ senderId, receiverId, amountZats, ctx }) {
+  const groupId = String(ctx.chat.id);
+  const sender = db.users.findById.get(senderId);
+  const receiver = db.users.findById.get(receiverId);
+
+  const validation = validateTip({ sender, receiver, amountZats, groupId });
+  if (!validation.valid) return { success: false, reason: validation.reason };
+
+  const { isLarge, usdValue } = await amount.checkLargeTip(BigInt(amountZats));
+
+  if (!isLarge) {
+    return executeTip({ senderId, receiverId, amountZats, ctx });
+  }
+
+  // Large tip — require explicit confirmation before sending.
+  const now = Date.now();
+  const expiresAt = now + config.security.withdrawalConfirmTimeoutSecs * 1000;
+
+  db.confirmations.delete.run(senderId, 'tip');
+  db.confirmations.insert.run({
+    telegram_id: senderId,
+    type: 'tip',
+    payload_json: JSON.stringify({ receiverId, amountZats, groupId, groupTitle: ctx.chat.title || 'DM' }),
+    expires_at: expiresAt,
+    created_at: now,
+  });
+
+  const usdLine = usdValue !== null ? ` (~$${usdValue.toFixed(2)})` : '';
+  const receiverName = receiver.username ? `@${receiver.username}` : receiver.first_name;
+
+  return {
+    success: true,
+    requiresConfirmation: true,
+    prompt: [
+      `⚠️ *Large Tip — Please Confirm*\n`,
+      `You're about to tip *${wallet.formatZec(amountZats)}*${usdLine}`,
+      `To: ${receiverName}\n`,
+      `Reply *YES* within ${config.security.withdrawalConfirmTimeoutSecs}s to confirm, or *NO* to cancel.`,
+    ].join('\n'),
+  };
+}
+
+/**
+ * Confirms and executes a pending large tip (after /tip triggered the
+ * large-tip confirmation flow and the user replied YES).
+ */
+async function confirmTip(senderId, ctx) {
+  const pending = db.confirmations.get.get(senderId, 'tip', Date.now());
+  if (!pending) {
+    return { success: false, reason: 'No pending tip found, or it has expired. Please run /tip again.' };
+  }
+
+  db.confirmations.delete.run(senderId, 'tip');
+
+  const { receiverId, amountZats } = JSON.parse(pending.payload_json);
+  return executeTip({ senderId, receiverId, amountZats, ctx });
+}
+
+/**
+ * Cancels a pending large-tip confirmation.
+ */
+function cancelTip(senderId) {
+  db.confirmations.delete.run(senderId, 'tip');
 }
 
 /**
@@ -232,6 +303,9 @@ function getUserStats(telegramId) {
 module.exports = {
   resolveTarget,
   validateTip,
+  initiateTip,
+  confirmTip,
+  cancelTip,
   executeTip,
   executeRain,
   getTipHistory,
