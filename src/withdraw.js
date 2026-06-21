@@ -3,6 +3,7 @@
 const db = require('./db');
 const wallet = require('./wallet');
 const config = require('./config');
+const amount = require('./amount');
 const logger = require('./logger');
 
 /**
@@ -32,14 +33,23 @@ async function initiateWithdrawal({ telegramId, toAddress, amountInput }) {
   const addrCheck = wallet.rejectNonUA(toAddress);
   if (!addrCheck.valid) return { success: false, reason: addrCheck.reason };
 
-  // Parse amount
-  let amountZats;
+  // Parse amount — accepts ZEC ("0.01") or USD ("$5", "5usd")
+  let parsed;
   try {
-    amountZats = Number(wallet.zecToZats(amountInput));
-    if (!Number.isFinite(amountZats) || amountZats <= 0) throw new Error('invalid');
-  } catch {
-    return { success: false, reason: 'Invalid amount. Use a number like 0.01 (in ZEC).' };
+    parsed = await amount.parseAmount(amountInput);
+  } catch (err) {
+    if (err.message === 'PRICE_UNAVAILABLE') {
+      return { success: false, reason: 'Could not fetch the current ZEC price to convert your USD amount. Please try again shortly, or specify the amount in ZEC instead.' };
+    }
+    throw err;
   }
+
+  if (!parsed) {
+    return { success: false, reason: 'Invalid amount. Use a ZEC amount like 0.01, or a USD amount like $5.' };
+  }
+
+  const amountZats = Number(parsed.amountZats);
+  const usdNote = parsed.currency === 'USD' ? ` (~$${parsed.rawUsd.toFixed(2)})` : '';
 
   // Calculate ZIP-317 fee
   const feeZats = Number(wallet.calculateFee(2));
@@ -72,15 +82,21 @@ async function initiateWithdrawal({ telegramId, toAddress, amountInput }) {
     created_at: now,
   });
 
+  const { isLarge, usdValue } = await amount.checkLargeTip(BigInt(amountZats));
+  const usdLine = usdNote || (usdValue !== null ? ` (~$${usdValue.toFixed(2)})` : '');
+  const largeNote = isLarge
+    ? `\n⚠️ _This is a large withdrawal — double-check the address before confirming._\n`
+    : '';
+
   return {
     success: true,
     requiresConfirmation: true,
     prompt: [
       `⚠️ *Confirm Withdrawal*\n`,
-      `Amount: *${wallet.formatZec(amountZats)}*`,
+      `Amount: *${wallet.formatZec(amountZats)}*${usdLine}`,
       `Fee: ${wallet.formatZec(feeZats)} (ZIP-317)`,
       `Total deducted: *${wallet.formatZec(totalNeeded)}*`,
-      `To: \`${toAddress.slice(0, 20)}...${toAddress.slice(-6)}\`\n`,
+      `To: \`${toAddress.slice(0, 20)}...${toAddress.slice(-6)}\`${largeNote}`,
       `Reply *YES* within ${config.security.withdrawalConfirmTimeoutSecs}s to confirm, or *NO* to cancel.`,
     ].join('\n'),
   };
