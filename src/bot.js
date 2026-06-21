@@ -10,6 +10,7 @@ const db = require('./db');
 const wallet = require('./wallet');
 const tips = require('./tips');
 const withdraw = require('./withdraw');
+const amount = require('./amount');
 const messages = require('./messages');
 const { checkTipLimit, checkRegisterLimit, rateLimitMiddleware } = require('./rateLimiter');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
@@ -62,7 +63,9 @@ async function replyMd(ctx, text) {
   return ctx.reply(text, { parse_mode: 'Markdown' });
 }
 
-// Parse ZEC amount from string, returns zatoshis or null
+// Parse a ZEC-only amount string, returns zatoshis or null.
+// Used by /rain and /setmintip, which are ZEC-only (USD support is
+// /tip and /withdraw only, via amount.parseAmount which also accepts USD).
 function parseAmount(amountStr) {
   if (!amountStr) return null;
   try {
@@ -281,20 +284,34 @@ bot.command('tip', async (ctx) => {
   let targetUsername = null;
   let amountStr = null;
 
-  // Parse: /tip @username 0.001 OR /tip 0.001 (reply)
-  if (args.length >= 2 && args[0].startsWith('@')) {
+  // Parse: /tip @username 0.001 | /tip @username $5 | /tip @username 5 usd
+  //     or: /tip 0.001 (reply)  | /tip $5 (reply)    | /tip 5 usd (reply)
+  if (args.length >= 1 && args[0].startsWith('@')) {
     targetUsername = args[0];
-    amountStr = args[1];
-  } else if (args.length >= 1 && !args[0].startsWith('@')) {
-    amountStr = args[0];
-  } else if (args.length >= 1 && args[0].startsWith('@') && !args[1]) {
-    return replyMd(ctx, '❌ Usage: /tip @username 0.001 or reply to a message with /tip 0.001');
+    amountStr = args.slice(1).join(' '); // supports "5 usd" as two tokens
+  } else if (args.length >= 1) {
+    amountStr = args.join(' ');
   }
 
-  const amountZats = parseAmount(amountStr);
-  if (!amountZats) {
-    return replyMd(ctx, '❌ Invalid amount. Example: /tip @username 0.001');
+  if (targetUsername && !amountStr) {
+    return replyMd(ctx, '❌ Usage: /tip @username 0.001 or reply to a message with /tip 0.001\nUSD also works: /tip @username $5');
   }
+
+  let parsed;
+  try {
+    parsed = await amount.parseAmount(amountStr);
+  } catch (err) {
+    if (err.message === 'PRICE_UNAVAILABLE') {
+      return replyMd(ctx, '❌ Could not fetch the current ZEC price for your USD amount. Please try again shortly, or use a ZEC amount instead.');
+    }
+    throw err;
+  }
+
+  if (!parsed) {
+    return replyMd(ctx, '❌ Invalid amount. Example: /tip @username 0.001  or  /tip @username $5');
+  }
+
+  const amountZats = Number(parsed.amountZats);
 
   const sender = db.users.findById.get(id);
   if (!sender) return replyMd(ctx, '❌ You are not registered. Use /register first.');
@@ -306,16 +323,15 @@ bot.command('tip', async (ctx) => {
       : `❌ User not found. They need to /register first.`);
   }
 
-  const result = await tips.executeTip({
+  const result = await tips.initiateTip({
     senderId: id,
     receiverId: receiver.telegram_id,
     amountZats,
     ctx,
   });
 
-  if (!result.success) {
-    return replyMd(ctx, `❌ ${result.reason}`);
-  }
+  if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+  if (result.requiresConfirmation) return replyMd(ctx, result.prompt);
 
   return replyMd(ctx, messages.tipSuccess(result.sender, result.receiver, result.amountZats));
 });
@@ -352,12 +368,14 @@ bot.command('withdraw', async (ctx) => {
     return replyMd(ctx, [
       `❌ Usage: /withdraw <address> <amount>`,
       `Example: /withdraw u1abc...xyz 0.05`,
+      `USD also works: /withdraw u1abc...xyz $5`,
       ``,
       `⚠️ Only Unified Addresses (u1...) are accepted.`,
     ].join('\n'));
   }
 
-  const [toAddress, amountInput] = args;
+  const toAddress = args[0];
+  const amountInput = args.slice(1).join(' '); // supports "5 usd" as two tokens
 
   const result = await withdraw.initiateWithdrawal({ telegramId: id, toAddress, amountInput });
 
@@ -370,17 +388,32 @@ bot.command('withdraw', async (ctx) => {
 bot.hears(/^(YES|NO|yes|no)$/i, async (ctx) => {
   const id = telegramId(ctx);
   const response = ctx.message.text.toUpperCase();
+  const now = Date.now();
 
-  // Check if there's a pending withdrawal confirmation
-  const pending = db.confirmations.get.get(id, 'withdrawal', Date.now());
-  if (!pending) return; // Not a confirmation context, ignore
+  // Check for either kind of pending confirmation — withdrawal or large tip.
+  // Whichever was created more recently wins if (improbably) both are pending.
+  const pendingWithdrawal = db.confirmations.get.get(id, 'withdrawal', now);
+  const pendingTip = db.confirmations.get.get(id, 'tip', now);
+
+  if (!pendingWithdrawal && !pendingTip) return; // Not a confirmation context, ignore
+
+  const isTip = pendingTip && (!pendingWithdrawal || pendingTip.created_at > pendingWithdrawal.created_at);
 
   if (response === 'NO') {
+    if (isTip) {
+      tips.cancelTip(id);
+      return replyMd(ctx, '❌ Tip cancelled.');
+    }
     withdraw.cancelWithdrawal(id);
     return replyMd(ctx, '❌ Withdrawal cancelled.');
   }
 
   if (response === 'YES') {
+    if (isTip) {
+      const result = await tips.confirmTip(id, ctx);
+      if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+      return replyMd(ctx, messages.tipSuccess(result.sender, result.receiver, result.amountZats));
+    }
     const result = await withdraw.confirmWithdrawal(id);
     if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
     return replyMd(ctx, messages.withdrawSuccess(result));
