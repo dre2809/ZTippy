@@ -1,211 +1,323 @@
 'use strict';
 
-const wallet = require('./wallet');
+const Database = require('better-sqlite3');
 const config = require('./config');
+const logger = require('./logger');
+const path = require('path');
+const fs = require('fs');
 
-/**
- * Formats a display name: @username or First Name
- */
-function displayName(user) {
-  if (user.username) return `@${user.username}`;
-  return user.first_name || 'Unknown';
+// Ensure data directory exists
+const dbDir = path.dirname(config.db.path);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
 }
 
-/**
- * Truncates a UA address for display: u1abcd...xyz
- */
-function shortAddress(addr) {
-  if (!addr || addr.length < 20) return addr;
-  return `${addr.slice(0, 10)}...${addr.slice(-6)}`;
-}
+const db = new Database(config.db.path);
 
-const LOGO = '🛡️';
-const ZEC_LOGO = '⚡';
+// Enable WAL mode for better concurrent read performance
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+db.pragma('synchronous = NORMAL');
 
-function welcome(user, uaAddress) {
-  return [
-    `${LOGO} *Welcome to ${config.community.name}!*`,
-    ``,
-    `You're registered and ready to tip ZEC privately —`,
-    `your wallet works in *every* group this bot is in.`,
-    ``,
-    `📬 *Your Deposit Address:*`,
-    `\`${uaAddress}\``,
-    ``,
-    `This is a Zcash Unified Address (ZIP-316).`,
-    `Send ZEC here to top up your tip balance.`,
-    ``,
-    `*Quick Start:*`,
-    `• /balance — check your balance`,
-    `• /tip @user 0.001 — tip someone`,
-    `• /help — all commands`,
-  ].join('\n');
-}
+// ─── Schema Migrations ────────────────────────────────────────────────────────
 
-function alreadyRegistered(user) {
-  return [
-    `${LOGO} You're already registered!`,
-    ``,
-    `📬 Your address: \`${user.ua_address}\``,
-    `💰 Balance: *${wallet.formatZec(user.balance_zats)}*`,
-  ].join('\n');
-}
+function migrate() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_versions (
+      version   INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    );
+  `);
 
-function balanceMessage(user) {
-  const zec = wallet.zatsToZec(user.balance_zats);
-  const zats = user.balance_zats.toLocaleString();
-  return [
-    `💰 *Your Balance*`,
-    ``,
-    `${ZEC_LOGO} *${zec} ZEC*`,
-    `_${zats} zatoshis_`,
-    ``,
-    `📬 Deposit: \`${user.ua_address}\``,
-    ``,
-    `_All balances are shielded (Orchard pool)_`,
-  ].join('\n');
-}
+  const migrations = [
+    // v1: Core tables
+    () => db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        telegram_id    TEXT PRIMARY KEY,
+        username       TEXT,
+        first_name     TEXT,
+        div_index      INTEGER UNIQUE NOT NULL,
+        ua_address     TEXT UNIQUE NOT NULL,
+        balance_zats   INTEGER DEFAULT 0 CHECK(balance_zats >= 0),
+        registered_at  INTEGER NOT NULL,
+        last_active_at INTEGER
+      );
 
-function tipSuccess(sender, receiver, amountZats) {
-  return [
-    `${ZEC_LOGO} *Tip Sent!*`,
-    ``,
-    `*${displayName(sender)}* → *${displayName(receiver)}*`,
-    `Amount: *${wallet.formatZec(amountZats)}*`,
-    ``,
-    `_Shielded via Orchard pool (ZIP-224)_`,
-  ].join('\n');
-}
+      CREATE TABLE IF NOT EXISTS tips (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_id       TEXT NOT NULL REFERENCES users(telegram_id),
+        to_id         TEXT NOT NULL REFERENCES users(telegram_id),
+        amount_zats   INTEGER NOT NULL CHECK(amount_zats > 0),
+        memo_json     TEXT,
+        txid          TEXT,
+        group_id      TEXT,
+        group_title   TEXT,
+        created_at    INTEGER NOT NULL
+      );
 
-function withdrawSuccess({ txid, amountZats, toAddress }) {
-  return [
-    `✅ *Withdrawal Broadcast*`,
-    ``,
-    `Amount: *${wallet.formatZec(amountZats)}*`,
-    `To: \`${shortAddress(toAddress)}\``,
-    `TXID: \`${txid}\``,
-    ``,
-    `_Transaction will confirm in ~1-2 blocks (~75 seconds each)_`,
-    `_Track on: https://zcashblockexplorer.com/transactions/${txid}_`,
-  ].join('\n');
-}
+      CREATE TABLE IF NOT EXISTS withdrawals (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id     TEXT NOT NULL REFERENCES users(telegram_id),
+        to_address      TEXT NOT NULL,
+        amount_zats     INTEGER NOT NULL CHECK(amount_zats > 0),
+        fee_zats        INTEGER NOT NULL DEFAULT 0,
+        txid            TEXT,
+        status          TEXT DEFAULT 'pending' CHECK(status IN ('pending','awaiting_confirm','broadcast','confirmed','failed')),
+        failure_reason  TEXT,
+        created_at      INTEGER NOT NULL,
+        confirmed_at    INTEGER
+      );
 
-function leaderboard(topTippers, topReceivers, groupTitle) {
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-    .toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+      CREATE TABLE IF NOT EXISTS group_settings (
+        group_id         TEXT PRIMARY KEY,
+        group_title      TEXT,
+        min_tip_zats     INTEGER DEFAULT 10000,
+        admin_ids        TEXT,  -- JSON array of admin telegram_ids
+        created_at       INTEGER NOT NULL,
+        updated_at       INTEGER NOT NULL
+      );
 
-  const lines = [`🏆 *${groupTitle} Leaderboard*`, `_Last 30 days (since ${thirtyDaysAgo})_`, ``];
+      CREATE TABLE IF NOT EXISTS pending_confirmations (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id     TEXT NOT NULL,
+        type            TEXT NOT NULL CHECK(type IN ('withdrawal')),
+        payload_json    TEXT NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        created_at      INTEGER NOT NULL
+      );
 
-  lines.push(`*Top Tippers 💸*`);
-  if (topTippers.length === 0) {
-    lines.push(`_No tips yet — be the first!_`);
-  } else {
-    topTippers.forEach((u, i) => {
-      const medal = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][i] || `${i + 1}.`;
-      const name = u.username ? `@${u.username}` : u.first_name;
-      lines.push(`${medal} ${name} — *${wallet.formatZec(u.total_sent)}*`);
+      CREATE INDEX IF NOT EXISTS idx_tips_from_id    ON tips(from_id);
+      CREATE INDEX IF NOT EXISTS idx_tips_to_id      ON tips(to_id);
+      CREATE INDEX IF NOT EXISTS idx_tips_group_id   ON tips(group_id);
+      CREATE INDEX IF NOT EXISTS idx_tips_created_at ON tips(created_at);
+      CREATE INDEX IF NOT EXISTS idx_withdrawals_telegram_id ON withdrawals(telegram_id);
+      CREATE INDEX IF NOT EXISTS idx_withdrawals_status      ON withdrawals(status);
+    `),
+
+    // v2: Allow 'tip' as a pending_confirmations type (for large-tip
+    // confirmation flow), in addition to the existing 'withdrawal' type.
+    // SQLite can't ALTER a CHECK constraint directly, so rebuild the table.
+    () => db.exec(`
+      CREATE TABLE pending_confirmations_v2 (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id     TEXT NOT NULL,
+        type            TEXT NOT NULL CHECK(type IN ('withdrawal', 'tip')),
+        payload_json    TEXT NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        created_at      INTEGER NOT NULL
+      );
+
+      INSERT INTO pending_confirmations_v2
+        SELECT * FROM pending_confirmations;
+
+      DROP TABLE pending_confirmations;
+
+      ALTER TABLE pending_confirmations_v2 RENAME TO pending_confirmations;
+    `),
+  ];
+
+  const currentVersion = db.prepare('SELECT MAX(version) as v FROM schema_versions').get().v || 0;
+
+  for (let i = currentVersion; i < migrations.length; i++) {
+    logger.info(`Applying DB migration v${i + 1}...`);
+    const applyMigration = db.transaction(() => {
+      migrations[i]();
+      db.prepare('INSERT INTO schema_versions (version, applied_at) VALUES (?, ?)').run(i + 1, Date.now());
     });
+    applyMigration();
+    logger.info(`Migration v${i + 1} applied.`);
   }
+}
 
-  lines.push(``);
-  lines.push(`*Top Receivers 🎁*`);
-  if (topReceivers.length === 0) {
-    lines.push(`_No tips received yet_`);
-  } else {
-    topReceivers.forEach((u, i) => {
-      const medal = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'][i] || `${i + 1}.`;
-      const name = u.username ? `@${u.username}` : u.first_name;
-      lines.push(`${medal} ${name} — *${wallet.formatZec(u.total_received)}*`);
-    });
+// Run migrations immediately on module load — this MUST happen before any
+// of the prepared statements below are defined, since better-sqlite3's
+// db.prepare() validates SQL against the live schema at prepare-time, not
+// at execution-time. If the tables don't exist yet when prepare() runs,
+// it throws "no such table" immediately, even though the query itself
+// would be fine once tables exist.
+//
+// This makes db.migrate() (still exported below) idempotent and safe to
+// call again from bot.js — it's a no-op if migrations already ran here.
+migrate();
+
+// ─── User Queries ─────────────────────────────────────────────────────────────
+
+const userQueries = {
+  findById: db.prepare('SELECT * FROM users WHERE telegram_id = ?'),
+  findByUsername: db.prepare('SELECT * FROM users WHERE username = ?'),
+  findByAddress: db.prepare('SELECT * FROM users WHERE ua_address = ?'),
+
+  getMaxDivIndex: db.prepare('SELECT MAX(div_index) as max_idx FROM users'),
+
+  create: db.prepare(`
+    INSERT INTO users (telegram_id, username, first_name, div_index, ua_address, balance_zats, registered_at, last_active_at)
+    VALUES (@telegram_id, @username, @first_name, @div_index, @ua_address, 0, @registered_at, @registered_at)
+  `),
+
+  updateUsername: db.prepare(`
+    UPDATE users SET username = ?, first_name = ?, last_active_at = ? WHERE telegram_id = ?
+  `),
+
+  updateLastActive: db.prepare('UPDATE users SET last_active_at = ? WHERE telegram_id = ?'),
+
+  updateBalance: db.prepare('UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?'),
+
+  getTopTippers: db.prepare(`
+    SELECT u.username, u.first_name, SUM(t.amount_zats) as total_sent
+    FROM tips t JOIN users u ON t.from_id = u.telegram_id
+    WHERE t.group_id = ? AND t.created_at >= ?
+    GROUP BY t.from_id
+    ORDER BY total_sent DESC
+    LIMIT 5
+  `),
+
+  getTopReceivers: db.prepare(`
+    SELECT u.username, u.first_name, SUM(t.amount_zats) as total_received
+    FROM tips t JOIN users u ON t.to_id = u.telegram_id
+    WHERE t.group_id = ? AND t.created_at >= ?
+    GROUP BY t.to_id
+    ORDER BY total_received DESC
+    LIMIT 5
+  `),
+
+  getRecentActiveInGroup: db.prepare(`
+    SELECT DISTINCT u.telegram_id, u.username, u.first_name
+    FROM tips t
+    JOIN users u ON (t.from_id = u.telegram_id OR t.to_id = u.telegram_id)
+    WHERE t.group_id = ? AND t.created_at >= ?
+    ORDER BY t.created_at DESC
+    LIMIT ?
+  `),
+};
+
+// ─── Tip Queries ──────────────────────────────────────────────────────────────
+
+const tipQueries = {
+  insert: db.prepare(`
+    INSERT INTO tips (from_id, to_id, amount_zats, memo_json, group_id, group_title, created_at)
+    VALUES (@from_id, @to_id, @amount_zats, @memo_json, @group_id, @group_title, @created_at)
+  `),
+
+  getHistory: db.prepare(`
+    SELECT
+      t.*,
+      uf.username as from_username, uf.first_name as from_first_name,
+      ut.username as to_username, ut.first_name as to_first_name
+    FROM tips t
+    JOIN users uf ON t.from_id = uf.telegram_id
+    JOIN users ut ON t.to_id = ut.telegram_id
+    WHERE t.from_id = ? OR t.to_id = ?
+    ORDER BY t.created_at DESC
+    LIMIT 10
+  `),
+
+  getStats: db.prepare(`
+    SELECT
+      (SELECT COALESCE(SUM(amount_zats),0) FROM tips WHERE from_id = ?) as total_sent,
+      (SELECT COALESCE(SUM(amount_zats),0) FROM tips WHERE to_id = ?) as total_received,
+      (SELECT COUNT(*) FROM tips WHERE from_id = ?) as sent_count,
+      (SELECT COUNT(*) FROM tips WHERE to_id = ?) as received_count,
+      (SELECT COALESCE(MAX(amount_zats),0) FROM tips WHERE to_id = ?) as largest_received
+  `),
+};
+
+// ─── Withdrawal Queries ───────────────────────────────────────────────────────
+
+const withdrawalQueries = {
+  insert: db.prepare(`
+    INSERT INTO withdrawals (telegram_id, to_address, amount_zats, fee_zats, status, created_at)
+    VALUES (@telegram_id, @to_address, @amount_zats, @fee_zats, 'pending', @created_at)
+  `),
+
+  updateStatus: db.prepare(`
+    UPDATE withdrawals SET status = ?, txid = ?, failure_reason = ?, confirmed_at = ?
+    WHERE id = ?
+  `),
+
+  getLastWithdrawal: db.prepare(`
+    SELECT * FROM withdrawals WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 1
+  `),
+
+  getPending: db.prepare(`SELECT * FROM withdrawals WHERE status = 'broadcast'`),
+};
+
+// ─── Group Settings Queries ───────────────────────────────────────────────────
+
+const groupQueries = {
+  get: db.prepare('SELECT * FROM group_settings WHERE group_id = ?'),
+
+  upsert: db.prepare(`
+    INSERT INTO group_settings (group_id, group_title, min_tip_zats, admin_ids, created_at, updated_at)
+    VALUES (@group_id, @group_title, @min_tip_zats, @admin_ids, @now, @now)
+    ON CONFLICT(group_id) DO UPDATE SET
+      group_title = excluded.group_title,
+      min_tip_zats = excluded.min_tip_zats,
+      admin_ids = excluded.admin_ids,
+      updated_at = excluded.updated_at
+  `),
+
+  setMinTip: db.prepare('UPDATE group_settings SET min_tip_zats = ?, updated_at = ? WHERE group_id = ?'),
+};
+
+// ─── Pending Confirmation Queries ─────────────────────────────────────────────
+
+const confirmationQueries = {
+  insert: db.prepare(`
+    INSERT INTO pending_confirmations (telegram_id, type, payload_json, expires_at, created_at)
+    VALUES (@telegram_id, @type, @payload_json, @expires_at, @created_at)
+  `),
+
+  get: db.prepare(`
+    SELECT * FROM pending_confirmations
+    WHERE telegram_id = ? AND type = ? AND expires_at > ?
+    ORDER BY created_at DESC LIMIT 1
+  `),
+
+  delete: db.prepare('DELETE FROM pending_confirmations WHERE telegram_id = ? AND type = ?'),
+
+  cleanExpired: db.prepare('DELETE FROM pending_confirmations WHERE expires_at <= ?'),
+};
+
+// ─── Atomic Tip Transaction ───────────────────────────────────────────────────
+
+const executeTip = db.transaction((fromId, toId, amountZats, tipData) => {
+  // Debit sender
+  const debit = db.prepare('UPDATE users SET balance_zats = balance_zats - ? WHERE telegram_id = ? AND balance_zats >= ?');
+  const debitResult = debit.run(amountZats, fromId, amountZats);
+  if (debitResult.changes === 0) {
+    throw new Error('INSUFFICIENT_BALANCE');
   }
+  // Credit receiver
+  db.prepare('UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?').run(amountZats, toId);
+  // Record tip
+  tipQueries.insert.run(tipData);
+  // Update last active
+  const now = Date.now();
+  userQueries.updateLastActive.run(now, fromId);
+  userQueries.updateLastActive.run(now, toId);
+});
 
-  lines.push(``);
-  lines.push(`_${config.community.name}_`);
-  return lines.join('\n');
-}
+// ─── Atomic Withdrawal Debit ──────────────────────────────────────────────────
 
-function historyMessage(userId, tips) {
-  if (tips.length === 0) {
-    return `📜 *Tip History*\n\nNo tips yet. Send your first tip with /tip @user 0.001`;
+const executeWithdrawalDebit = db.transaction((telegramId, amountZats, feeZats, withdrawalData) => {
+  const totalZats = amountZats + feeZats;
+  const debit = db.prepare('UPDATE users SET balance_zats = balance_zats - ? WHERE telegram_id = ? AND balance_zats >= ?');
+  const result = debit.run(totalZats, telegramId, totalZats);
+  if (result.changes === 0) {
+    throw new Error('INSUFFICIENT_BALANCE');
   }
-
-  const lines = [`📜 *Your Last ${tips.length} Tips*`, ``];
-  for (const t of tips) {
-    const arrow = t.isSent ? `→ ${t.to_username ? '@' + t.to_username : t.to_first_name}` : `← ${t.from_username ? '@' + t.from_username : t.from_first_name}`;
-    const sign = t.isSent ? '−' : '+';
-    lines.push(`${sign}${wallet.formatZec(t.amount_zats)} ${arrow} _(${t.date})_`);
-  }
-  return lines.join('\n');
-}
-
-function statsMessage(user, stats) {
-  return [
-    `📊 *Your Stats*`,
-    ``,
-    `Sent: *${stats.totalSent}* (${stats.sentCount} tips)`,
-    `Received: *${stats.totalReceived}* (${stats.receivedCount} tips)`,
-    `Biggest tip received: *${stats.largestReceived}*`,
-    ``,
-    `Balance: *${wallet.formatZec(user.balance_zats)}*`,
-  ].join('\n');
-}
-
-function rainSuccess({ tippedUsers, perUserZats, totalZats }) {
-  const names = tippedUsers.map(u => u.username ? `@${u.username}` : u.first_name).join(', ');
-  return [
-    `🌧️ *It's Raining ZEC!*`,
-    ``,
-    `*${wallet.formatZec(perUserZats)}* each → ${tippedUsers.length} users`,
-    `Total: *${wallet.formatZec(totalZats)}*`,
-    ``,
-    `Recipients: ${names}`,
-  ].join('\n');
-}
-
-function helpMessage() {
-  return [
-    `${LOGO} *${config.community.name}*`,
-    `_Privacy-first ZEC tipping — works in any group I'm added to_`,
-    ``,
-    `*💸 Tipping*`,
-    `• /tip @username 0.001 — tip someone in this group`,
-    `• /tip @username $5 — tip using a USD amount`,
-    `• /tip 0.001 _(reply to a message)_ — tip the author`,
-    `• /rain 0.01 5 — split ZEC among 5 recent active users`,
-    ``,
-    `_Tips above ${config.tips.largeTipZecThreshold} ZEC or ~$${config.tips.largeTipUsdThreshold} require a quick YES/NO confirmation — just a safety check before larger amounts go out._`,
-    ``,
-    `*💰 Wallet*`,
-    `• /register — create your shielded wallet (works everywhere)`,
-    `• /address — show your deposit address`,
-    `• /balance — check your balance`,
-    `• /withdraw u1... 0.05 — send ZEC to your own wallet`,
-    `• /withdraw u1... $5 — withdraw using a USD amount`,
-    ``,
-    `*📊 Info*`,
-    `• /history — your last 10 tips`,
-    `• /stats — your personal totals`,
-    `• /leaderboard — top tippers in this group`,
-    ``,
-    `*⚙️ Group Admin*`,
-    `• /setmintip 0.0001 — set minimum tip for this group`,
-    ``,
-    `_All transactions use the Orchard shielded pool (ZIP-224)._`,
-    `_Your wallet and balance follow you across every group._`,
-  ].join('\n');
-}
+  const insertResult = withdrawalQueries.insert.run(withdrawalData);
+  return insertResult.lastInsertRowid;
+});
 
 module.exports = {
-  displayName,
-  shortAddress,
-  welcome,
-  alreadyRegistered,
-  balanceMessage,
-  tipSuccess,
-  withdrawSuccess,
-  leaderboard,
-  historyMessage,
-  statsMessage,
-  rainSuccess,
-  helpMessage,
+  migrate,
+  db,
+  users: userQueries,
+  tips: tipQueries,
+  withdrawals: withdrawalQueries,
+  groups: groupQueries,
+  confirmations: confirmationQueries,
+  executeTip,
+  executeWithdrawalDebit,
 };
