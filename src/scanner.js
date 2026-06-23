@@ -167,9 +167,21 @@ async function processBlock(block, users) {
     // Orchard actions present = potential shielded output
     if (!ctx.actions || ctx.actions.length === 0) continue;
 
-    const txid = Buffer.isBuffer(ctx.hash)
-      ? ctx.hash.toString('hex')
-      : Buffer.from(ctx.hash, 'base64').toString('hex');
+    const txid = (() => {
+      if (!ctx.hash) return null;
+      if (Buffer.isBuffer(ctx.hash)) return ctx.hash.toString('hex');
+      if (typeof ctx.hash === 'string') {
+        // Could be base64 or hex
+        if (/^[0-9a-fA-F]+$/.test(ctx.hash)) return ctx.hash.toLowerCase();
+        try { return Buffer.from(ctx.hash, 'base64').toString('hex'); } catch { return null; }
+      }
+      if (ctx.hash.type === 'Buffer' && ctx.hash.data) {
+        return Buffer.from(ctx.hash.data).toString('hex');
+      }
+      return null;
+    })();
+
+    if (!txid) continue;
 
     // Check if we've already credited this txid for any user
     const existing = await db.execute(
