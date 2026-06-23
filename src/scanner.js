@@ -39,13 +39,21 @@ const wallet = require('./wallet');
 const config = require('./config');
 const logger = require('./logger');
 
-// Proto file location
+// Proto file location — only available on the VPS alongside lightwalletd
 const PROTO_PATH = path.join(os.homedir(), 'lightwalletd/walletrpc/service.proto');
 const PROTO_INCLUDE = path.join(os.homedir(), 'lightwalletd/walletrpc');
+
+// Check if we can actually run the scanner (proto file must exist)
+const SCANNER_AVAILABLE = require('fs').existsSync(PROTO_PATH);
+
+if (!SCANNER_AVAILABLE) {
+  logger.info('Scanner: proto file not found — scanner disabled (run on VPS only)');
+}
 
 let grpcClient = null;
 
 function getClient() {
+  if (!SCANNER_AVAILABLE) return null;
   if (grpcClient) return grpcClient;
 
   try {
@@ -342,6 +350,11 @@ async function manualCredit(telegramId, txid, amountZats, blockHeight = 0) {
  */
 function startScanner(botInstance) {
   global.botInstance = botInstance;
+
+  if (!SCANNER_AVAILABLE) {
+    logger.info('Scanner: disabled on this deployment (no lightwalletd proto — run scanner separately on VPS)');
+    return null;
+  }
 
   const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '30000', 10);
 
