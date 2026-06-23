@@ -35,6 +35,10 @@ module.exports = {
     network: process.env.ZCASH_NETWORK || 'mainnet',
     lightwalletdUrl: process.env.LIGHTWALLETD_URL || 'grpc://localhost:9067',
     seedPhrase: process.env.BOT_SEED_PHRASE,
+    // zebrad RPC — used by the deposit scanner
+    zebradRpcUrl: process.env.ZEBRAD_RPC_URL || 'http://127.0.0.1:8232',
+    rpcUser: process.env.ZEBRAD_RPC_USER || 'zcash',
+    rpcPassword: process.env.ZEBRAD_RPC_PASSWORD || '',
   },
 
   community: {
