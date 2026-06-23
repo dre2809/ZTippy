@@ -12,6 +12,7 @@ const tips = require('./tips');
 const withdraw = require('./withdraw');
 const amount = require('./amount');
 const messages = require('./messages');
+const scanner = require('./scanner');
 const { checkTipLimit, checkRegisterLimit, rateLimitMiddleware } = require('./rateLimiter');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 const logger = require('./logger');
@@ -31,8 +32,11 @@ logger.info(`Starting ${config.community.name}...`);
 logger.info(`Network: ${config.zcash.network}`);
 if (wallet.MOCK) logger.warn('MOCK WALLET MODE — not connected to Zcash network');
 
-// Run migrations
-db.migrate();
+// Run migrations synchronously before bot starts
+db.migrate().catch(err => {
+  logger.error('Migration failed:', err);
+  process.exit(1);
+});
 
 // ─── Bot Init ─────────────────────────────────────────────────────────────────
 
@@ -44,10 +48,10 @@ bot.use(rateLimitMiddleware());
 // Update user metadata on every interaction
 bot.use(async (ctx, next) => {
   if (ctx.from) {
-    const user = db.users.findById.get(String(ctx.from.id));
+    const user = await db.users.findById(String(ctx.from.id));
     if (user) {
       const username = ctx.from.username?.toLowerCase() || null;
-      db.users.updateUsername.run(username, ctx.from.first_name || null, Date.now(), String(ctx.from.id));
+      await db.users.updateUsername(username, ctx.from.first_name || null, Date.now(), String(ctx.from.id));
     }
   }
   return next();
@@ -89,7 +93,7 @@ bot.on('new_chat_members', async (ctx) => {
   // Only rate-limit groups we haven't seen before — re-adds after a kick
   // (e.g. admin removed and re-added the bot) shouldn't count against the
   // global join limit.
-  const isNewGroup = !db.groups.get.get(groupId);
+  const isNewGroup = !(await db.groups.get(groupId));
 
   if (isNewGroup) {
     try {
@@ -107,7 +111,7 @@ bot.on('new_chat_members', async (ctx) => {
   const now = Date.now();
 
   // Register the group with default settings — no admin config required.
-  db.groups.upsert.run({
+  await db.groups.upsert({
     group_id: groupId,
     group_title: ctx.chat.title || 'Unnamed Group',
     min_tip_zats: config.tips.minZatoshis,
@@ -141,13 +145,16 @@ bot.command('stats_global', async (ctx) => {
     return; // silently ignore for non-owners
   }
 
-  const groupCount = db.db.prepare('SELECT COUNT(*) as c FROM group_settings').get().c;
-  const userCount = db.db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-  const tipCount = db.db.prepare('SELECT COUNT(*) as c FROM tips').get().c;
-  const totalTipped = db.db.prepare('SELECT COALESCE(SUM(amount_zats),0) as s FROM tips').get().s;
-  const withdrawalCount = db.db.prepare("SELECT COUNT(*) as c FROM withdrawals WHERE status = 'broadcast'").get().c;
+  const [gc, uc, tc, tt, wc] = await Promise.all([
+    db.execute('SELECT COUNT(*) as c FROM group_settings').then(r => r.rows[0].c),
+    db.execute('SELECT COUNT(*) as c FROM users').then(r => r.rows[0].c),
+    db.execute('SELECT COUNT(*) as c FROM tips').then(r => r.rows[0].c),
+    db.execute('SELECT COALESCE(SUM(amount_zats),0) as s FROM tips').then(r => r.rows[0].s),
+    db.execute("SELECT COUNT(*) as c FROM withdrawals WHERE status = 'broadcast'").then(r => r.rows[0].c),
+  ]);
   const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const activeGroups7d = db.db.prepare('SELECT COUNT(DISTINCT group_id) as c FROM tips WHERE created_at >= ?').get(sevenDaysAgo).c;
+  const activeGroups7d = await db.execute('SELECT COUNT(DISTINCT group_id) as c FROM tips WHERE created_at >= ?', [sevenDaysAgo]).then(r => r.rows[0].c);
+  const [groupCount, userCount, tipCount, totalTipped, withdrawalCount] = [gc, uc, tc, tt, wc];
 
   return replyMd(ctx, [
     `📊 *Global Bot Stats*`,
@@ -201,7 +208,7 @@ bot.command('help', async (ctx) => {
 
 bot.command('register', async (ctx) => {
   const id = telegramId(ctx);
-  const existing = db.users.findById.get(id);
+  const existing = await db.users.findById(id);
 
   if (existing) {
     return replyMd(ctx, messages.alreadyRegistered(existing));
@@ -213,7 +220,7 @@ bot.command('register', async (ctx) => {
   }
 
   // Derive next diversifier index
-  const maxResult = db.users.getMaxDivIndex.get();
+  const maxResult = await db.users.getMaxDivIndex();
   const nextDivIndex = (maxResult.max_idx ?? -1) + 1;
 
   // Derive unique u1... address
@@ -227,7 +234,7 @@ bot.command('register', async (ctx) => {
 
   // Store user
   try {
-    db.users.create.run({
+    await db.users.create({
       telegram_id: id,
       username: ctx.from.username?.toLowerCase() || null,
       first_name: ctx.from.first_name || null,
@@ -247,7 +254,7 @@ bot.command('register', async (ctx) => {
 // ─── /address ────────────────────────────────────────────────────────────────
 
 bot.command('address', async (ctx) => {
-  const user = db.users.findById.get(telegramId(ctx));
+  const user = await db.users.findById(telegramId(ctx));
   if (!user) return replyMd(ctx, '❌ You are not registered. Use /register to get started.');
 
   return replyMd(ctx, [
@@ -263,7 +270,7 @@ bot.command('address', async (ctx) => {
 // ─── /balance ────────────────────────────────────────────────────────────────
 
 bot.command('balance', async (ctx) => {
-  const user = db.users.findById.get(telegramId(ctx));
+  const user = await db.users.findById(telegramId(ctx));
   if (!user) return replyMd(ctx, '❌ You are not registered. Use /register to get started.');
 
   return replyMd(ctx, messages.balanceMessage(user));
@@ -313,7 +320,7 @@ bot.command('tip', async (ctx) => {
 
   const amountZats = Number(parsed.amountZats);
 
-  const sender = db.users.findById.get(id);
+  const sender = await db.users.findById(id);
   if (!sender) return replyMd(ctx, '❌ You are not registered. Use /register first.');
 
   const receiver = await tips.resolveTarget(ctx, targetUsername);
@@ -392,8 +399,10 @@ bot.hears(/^(YES|NO|yes|no)$/i, async (ctx) => {
 
   // Check for either kind of pending confirmation — withdrawal or large tip.
   // Whichever was created more recently wins if (improbably) both are pending.
-  const pendingWithdrawal = db.confirmations.get.get(id, 'withdrawal', now);
-  const pendingTip = db.confirmations.get.get(id, 'tip', now);
+  const [pendingWithdrawal, pendingTip] = await Promise.all([
+    db.confirmations.get(id, 'withdrawal', now),
+    db.confirmations.get(id, 'tip', now),
+  ]);
 
   if (!pendingWithdrawal && !pendingTip) return; // Not a confirmation context, ignore
 
@@ -424,10 +433,10 @@ bot.hears(/^(YES|NO|yes|no)$/i, async (ctx) => {
 
 bot.command('history', async (ctx) => {
   const id = telegramId(ctx);
-  const user = db.users.findById.get(id);
+  const user = await db.users.findById(id);
   if (!user) return replyMd(ctx, '❌ You are not registered. Use /register first.');
 
-  const history = tips.getTipHistory(id);
+  const history = await tips.getTipHistory(id);
   return replyMd(ctx, messages.historyMessage(id, history));
 });
 
@@ -435,10 +444,10 @@ bot.command('history', async (ctx) => {
 
 bot.command('stats', async (ctx) => {
   const id = telegramId(ctx);
-  const user = db.users.findById.get(id);
+  const user = await db.users.findById(id);
   if (!user) return replyMd(ctx, '❌ You are not registered. Use /register first.');
 
-  const userStats = tips.getUserStats(id);
+  const userStats = await tips.getUserStats(id);
   return replyMd(ctx, messages.statsMessage(user, userStats));
 });
 
@@ -453,8 +462,10 @@ bot.command('leaderboard', async (ctx) => {
   const groupTitle = ctx.chat.title || 'This Group';
   const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
 
-  const topTippers = db.users.getTopTippers.all(groupId, thirtyDaysAgo);
-  const topReceivers = db.users.getTopReceivers.all(groupId, thirtyDaysAgo);
+  const [topTippers, topReceivers] = await Promise.all([
+    db.users.getTopTippers(groupId, thirtyDaysAgo),
+    db.users.getTopReceivers(groupId, thirtyDaysAgo),
+  ]);
 
   return replyMd(ctx, messages.leaderboard(topTippers, topReceivers, groupTitle));
 });
@@ -480,7 +491,7 @@ bot.command('setmintip', async (ctx) => {
   const groupId = String(ctx.chat.id);
   const now = Date.now();
 
-  db.groups.upsert.run({
+  await db.groups.upsert({
     group_id: groupId,
     group_title: ctx.chat.title,
     min_tip_zats: amountZats,
@@ -501,20 +512,18 @@ bot.catch((err, ctx) => {
 // ─── Cron Jobs ────────────────────────────────────────────────────────────────
 
 // Clean up expired confirmations every 5 minutes
-cron.schedule('*/5 * * * *', () => {
-  db.confirmations.cleanExpired.run(Date.now());
+cron.schedule('*/5 * * * *', async () => {
+  await db.confirmations.cleanExpired(Date.now());
   logger.debug('Cleaned expired confirmations');
 });
 
 // ─── Launch ───────────────────────────────────────────────────────────────────
 
 bot.launch({
-  // 'message' already includes new_chat_members as a message subtype,
-  // but it's listed explicitly here for clarity since it's core to
-  // Rose-style zero-setup group onboarding.
   allowedUpdates: ['message', 'callback_query'],
 }).then(() => {
   logger.info(`✅ ${config.community.name} is live!`);
+  scanner.startScanner(bot);
 }).catch((err) => {
   logger.error('Failed to launch bot:', err);
   process.exit(1);
