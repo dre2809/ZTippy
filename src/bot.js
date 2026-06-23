@@ -135,7 +135,47 @@ bot.on('new_chat_members', async (ctx) => {
   ].join('\n'));
 });
 
-// ─── /stats_global (bot owner only, DM only) ─────────────────────────────────
+// ─── /credit (bot owner only — manual deposit credit) ────────────────────────
+
+bot.command('credit', async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!config.telegram.ownerId || telegramId(ctx) !== config.telegram.ownerId) return;
+
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  if (args.length < 3) {
+    return replyMd(ctx, [
+      `*Manual Deposit Credit*`,
+      ``,
+      `Usage: /credit <telegram_id> <txid> <amount_zec>`,
+      `Example: /credit 123456789 abc123... 0.5`,
+      ``,
+      `_Use this to manually credit a deposit that the scanner missed._`,
+    ].join('\n'));
+  }
+
+  const [targetId, txid, amountStr] = args;
+  const user = await db.users.findById(targetId);
+  if (!user) return replyMd(ctx, `❌ User ${targetId} not found.`);
+
+  let amountZats;
+  try {
+    amountZats = Number(wallet.zecToZats(amountStr));
+    if (!amountZats || amountZats <= 0) throw new Error('invalid');
+  } catch {
+    return replyMd(ctx, '❌ Invalid amount.');
+  }
+
+  await scanner.creditDeposit(targetId, txid, amountZats, 0);
+
+  const updated = await db.users.findById(targetId);
+  return replyMd(ctx, [
+    `✅ *Manual credit applied*`,
+    ``,
+    `User: @${user.username || targetId}`,
+    `Amount: *${wallet.formatZec(amountZats)}*`,
+    `New balance: *${wallet.formatZec(updated.balance_zats)}*`,
+  ].join('\n'));
+});
 
 bot.command('stats_global', async (ctx) => {
   if (ctx.chat.type !== 'private') {
