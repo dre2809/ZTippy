@@ -30,8 +30,6 @@
  * - Credits balance when a match is found
  */
 
-const grpc = require('@grpc/grpc-js');
-const protoLoader = require('@grpc/proto-loader');
 const path = require('path');
 const os = require('os');
 const db = require('./db');
@@ -57,6 +55,8 @@ function getClient() {
   if (grpcClient) return grpcClient;
 
   try {
+    const grpc = require('@grpc/grpc-js');
+    const protoLoader = require('@grpc/proto-loader');
     const pkg = protoLoader.loadSync(PROTO_PATH, {
       keepCase: true,
       longs: String,
