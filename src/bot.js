@@ -12,7 +12,6 @@ const tips = require('./tips');
 const withdraw = require('./withdraw');
 const amount = require('./amount');
 const messages = require('./messages');
-const scanner = require('./scanner');
 const { checkTipLimit, checkRegisterLimit, rateLimitMiddleware } = require('./rateLimiter');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 const logger = require('./logger');
@@ -165,7 +164,15 @@ bot.command('credit', async (ctx) => {
     return replyMd(ctx, '❌ Invalid amount.');
   }
 
-  await scanner.creditDeposit(targetId, txid, amountZats, 0);
+  await db.execute(
+    'UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?',
+    [amountZats, targetId]
+  );
+  await db.execute(
+    'INSERT OR IGNORE INTO deposits (telegram_id, txid, amount_zats, block_height, credited_at) VALUES (?, ?, ?, 0, ?)',
+    [targetId, txid, amountZats, Date.now()]
+  );
+  await db.syncToTurso();
 
   const updated = await db.users.findById(targetId);
   return replyMd(ctx, [
@@ -563,7 +570,6 @@ bot.launch({
   allowedUpdates: ['message', 'callback_query'],
 }).then(() => {
   logger.info(`✅ ${config.community.name} is live!`);
-  scanner.startScanner(bot);
 }).catch((err) => {
   logger.error('Failed to launch bot:', err);
   process.exit(1);
