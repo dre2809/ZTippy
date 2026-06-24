@@ -164,12 +164,21 @@ bot.command('credit', async (ctx) => {
     return replyMd(ctx, '❌ Invalid amount.');
   }
 
+  const existing = await db.execute(
+    'SELECT id FROM deposits WHERE telegram_id = ? AND txid = ?',
+    [targetId, txid]
+  ).then(r => r.rows[0]);
+
+  if (existing) {
+    return replyMd(ctx, \`❌ This transaction has already been credited to @\${user.username || targetId}.\`);
+  }
+
   await db.execute(
     'UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?',
     [amountZats, targetId]
   );
   await db.execute(
-    'INSERT OR IGNORE INTO deposits (telegram_id, txid, amount_zats, block_height, credited_at) VALUES (?, ?, ?, 0, ?)',
+    'INSERT INTO deposits (telegram_id, txid, amount_zats, block_height, credited_at) VALUES (?, ?, ?, 0, ?)',
     [targetId, txid, amountZats, Date.now()]
   );
   await db.syncToTurso();
