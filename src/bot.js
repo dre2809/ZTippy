@@ -164,13 +164,14 @@ bot.command('credit', async (ctx) => {
     return replyMd(ctx, '❌ Invalid amount.');
   }
 
+  // Check if this txid has already been credited
   const existing = await db.execute(
     'SELECT id FROM deposits WHERE telegram_id = ? AND txid = ?',
     [targetId, txid]
   ).then(r => r.rows[0]);
 
   if (existing) {
-    return replyMd(ctx, '❌ This transaction has already been credited to @' + (user.username || targetId) + '.');
+    return replyMd(ctx, `❌ This transaction has already been credited to @${user.username || targetId}.`);
   }
 
   await db.execute(
@@ -304,7 +305,36 @@ bot.command('register', async (ctx) => {
   }
 
   logger.info(`New user registered: ${id} (@${ctx.from.username}) | div_index: ${nextDivIndex}`);
-  return replyMd(ctx, messages.welcome(ctx.from, uaAddress));
+
+  // Claim any pending balances sent to this username before registration
+  const username = ctx.from.username?.toLowerCase();
+  let pendingTotal = 0;
+  if (username) {
+    const pending = await db.execute(
+      'SELECT SUM(amount_zats) as total FROM pending_balances WHERE to_username = ?',
+      [username]
+    ).then(r => r.rows[0]);
+
+    if (pending?.total > 0) {
+      pendingTotal = pending.total;
+      await db.execute(
+        'UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?',
+        [pendingTotal, id]
+      );
+      await db.execute(
+        'DELETE FROM pending_balances WHERE to_username = ?',
+        [username]
+      );
+      await db.syncToTurso();
+      logger.info(`Claimed ${wallet.formatZec(pendingTotal)} pending balance for @${username}`);
+    }
+  }
+
+  const welcomeMsg = messages.welcome(ctx.from, uaAddress);
+  if (pendingTotal > 0) {
+    return replyMd(ctx, welcomeMsg + `\n\n🎉 You had *${wallet.formatZec(pendingTotal)}* waiting for you from tips sent before you registered!`);
+  }
+  return replyMd(ctx, welcomeMsg);
 });
 
 // ─── /address ────────────────────────────────────────────────────────────────
@@ -379,22 +409,34 @@ bot.command('tip', async (ctx) => {
   const sender = await db.users.findById(id);
   if (!sender) return replyMd(ctx, '❌ You are not registered. Use /register first.');
 
+  // Try to resolve receiver — may be null if not registered
   const receiver = await tips.resolveTarget(ctx, targetUsername);
-  if (!receiver) {
-    return replyMd(ctx, targetUsername
-      ? `❌ User not found in this group. They need to /register and be a member here.`
-      : `❌ User not found. They need to /register first.`);
+
+  // If no receiver found and it's a reply-tip (no username), we can't identify them
+  if (!receiver && !targetUsername) {
+    return replyMd(ctx, '❌ User not found. They need to /register first.');
   }
 
   const result = await tips.initiateTip({
     senderId: id,
-    receiverId: receiver.telegram_id,
+    receiverId: receiver?.telegram_id || null,
+    receiverUsername: targetUsername,
     amountZats,
     ctx,
   });
 
   if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
   if (result.requiresConfirmation) return replyMd(ctx, result.prompt);
+
+  // Pending tip — recipient not yet registered
+  if (result.pending) {
+    return replyMd(ctx, [
+      `✅ *Tip queued!*`,
+      ``,
+      `*${result.formattedAmount}* is being held for @${result.username}.`,
+      `They'll receive it automatically when they /register.`,
+    ].join('\n'));
+  }
 
   return replyMd(ctx, messages.tipSuccess(result.sender, result.receiver, result.amountZats));
 });
