@@ -170,7 +170,7 @@ bot.command('credit', async (ctx) => {
   ).then(r => r.rows[0]);
 
   if (existing) {
-    return replyMd(ctx, \`❌ This transaction has already been credited to @\${user.username || targetId}.\`);
+    return replyMd(ctx, '❌ This transaction has already been credited to @' + (user.username || targetId) + '.');
   }
 
   await db.execute(
