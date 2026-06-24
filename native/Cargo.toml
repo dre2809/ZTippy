@@ -13,6 +13,7 @@ zcash_primitives     = "0.28"
 zcash_protocol       = "0.9"
 zcash_keys           = { version = "0.14", features = ["orchard"] }
 zcash_address        = "0.12"
+zcash_note_encryption = "0.4"
 orchard              = "0.14"
 bip0039 = { version = "0.14", features = ["all-languages"] }
 zip32   = "0.2"

@@ -36,6 +36,7 @@ mod keys;
 mod memo;
 mod network;
 mod seed;
+mod decrypt;
 
 use napi_derive::napi;
 
