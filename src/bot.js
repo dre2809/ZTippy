@@ -1,270 +1,637 @@
 'use strict';
 
+require('dotenv').config();
+
+const { Telegraf, Markup } = require('telegraf');
+const cron = require('node-cron');
+
+const config = require('./config');
 const db = require('./db');
 const wallet = require('./wallet');
-const config = require('./config');
+const tips = require('./tips');
+const withdraw = require('./withdraw');
 const amount = require('./amount');
+const messages = require('./messages');
+const { checkTipLimit, checkRegisterLimit, rateLimitMiddleware } = require('./rateLimiter');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
 const logger = require('./logger');
 
-async function resolveTarget(ctx, mentionedUsername) {
-  if (!mentionedUsername && ctx.message?.reply_to_message?.from) {
-    const replyFrom = ctx.message.reply_to_message.from;
-    return db.users.findById(String(replyFrom.id));
+// Caps how fast the bot will accept being added to *new* groups.
+// Protects against automated mass-add abuse (e.g. a botnet trying to add
+// this bot to thousands of groups rapidly), which risks Telegram rate-limiting
+// or banning the bot account entirely.
+const groupJoinLimiter = new RateLimiterMemory({
+  points: 20,    // 20 new groups
+  duration: 3600, // per hour, globally across all adds
+});
+
+// ─── Startup ──────────────────────────────────────────────────────────────────
+
+logger.info(`Starting ${config.community.name}...`);
+logger.info(`Network: ${config.zcash.network}`);
+if (wallet.MOCK) logger.warn('MOCK WALLET MODE — not connected to Zcash network');
+
+// Run migrations synchronously before bot starts
+db.migrate().catch(err => {
+  logger.error('Migration failed:', err);
+  process.exit(1);
+});
+
+// ─── Bot Init ─────────────────────────────────────────────────────────────────
+
+const bot = new Telegraf(config.telegram.token);
+
+// Global middleware
+bot.use(rateLimitMiddleware());
+
+// Update user metadata on every interaction
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    const user = await db.users.findById(String(ctx.from.id));
+    if (user) {
+      const username = ctx.from.username?.toLowerCase() || null;
+      await db.users.updateUsername(username, ctx.from.first_name || null, Date.now(), String(ctx.from.id));
+    }
   }
-  if (!mentionedUsername) return null;
+  return next();
+});
 
-  const clean = mentionedUsername.replace(/^@/, '').toLowerCase();
-  const candidate = await db.users.findByUsername(clean);
-  if (!candidate) return null;
+// ─── Helper ──────────────────────────────────────────────────────────────────
 
-  if (ctx.chat.type === 'private') return candidate;
+function telegramId(ctx) {
+  return String(ctx.from.id);
+}
 
+async function replyMd(ctx, text) {
+  return ctx.reply(text, { parse_mode: 'Markdown' });
+}
+
+// Parse a ZEC-only amount string, returns zatoshis or null.
+// Used by /rain and /setmintip, which are ZEC-only (USD support is
+// /tip and /withdraw only, via amount.parseAmount which also accepts USD).
+function parseAmount(amountStr) {
+  if (!amountStr) return null;
   try {
-    const member = await ctx.telegram.getChatMember(ctx.chat.id, Number(candidate.telegram_id));
-    const validStatuses = ['creator', 'administrator', 'member', 'restricted'];
-    if (!validStatuses.includes(member.status)) return null;
-    return candidate;
-  } catch (err) {
+    const zats = wallet.zecToZats(amountStr);
+    if (zats <= 0n) return null;
+    return Number(zats);
+  } catch {
     return null;
   }
 }
 
-async function validateTip({ sender, receiver, amountZats, groupId }) {
-  if (!sender) return { valid: false, reason: 'You are not registered. Use /register first.' };
-  if (!receiver) return { valid: false, reason: 'Recipient not found. They need to /register first.' };
-  if (sender.telegram_id === receiver.telegram_id) return { valid: false, reason: "You can't tip yourself!" };
+// ─── Auto-Register Groups (Rose-style: zero setup on add) ───────────────────
 
-  const groupSettings = await db.groups.get(groupId);
-  const minTip = groupSettings?.min_tip_zats ?? config.tips.minZatoshis;
+// Fired when the bot itself (or anyone) is added to a new group.
+bot.on('new_chat_members', async (ctx) => {
+  const botWasAdded = ctx.message.new_chat_members.some(m => m.id === ctx.botInfo.id);
+  if (!botWasAdded) return;
 
-  if (amountZats < minTip) return { valid: false, reason: `Minimum tip is ${wallet.formatZec(minTip)}.` };
-  if (BigInt(sender.balance_zats) < BigInt(amountZats)) {
-    return { valid: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
-  }
-  return { valid: true };
-}
-
-async function initiateTip({ senderId, receiverId, receiverUsername, amountZats, ctx }) {
   const groupId = String(ctx.chat.id);
-  const sender = await db.users.findById(senderId);
-  if (!sender) return { success: false, reason: 'You are not registered. Use /register first.' };
 
-  const groupSettings = await db.groups.get(groupId);
-  const minTip = groupSettings?.min_tip_zats ?? config.tips.minZatoshis;
-  if (amountZats < minTip) return { success: false, reason: `Minimum tip is ${wallet.formatZec(minTip)}.` };
-  if (BigInt(sender.balance_zats) < BigInt(amountZats)) {
-    return { success: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
+  // Only rate-limit groups we haven't seen before — re-adds after a kick
+  // (e.g. admin removed and re-added the bot) shouldn't count against the
+  // global join limit.
+  const isNewGroup = !(await db.groups.get(groupId));
+
+  if (isNewGroup) {
+    try {
+      await groupJoinLimiter.consume('global');
+    } catch {
+      logger.warn(`Group join rate limit hit — declining to onboard ${ctx.chat.title} (${groupId})`);
+      await replyMd(ctx, [
+        `⚠️ Too many groups are adding this bot right now.`,
+        `Please try again in a little while.`,
+      ].join('\n')).catch(() => {});
+      return ctx.leaveChat().catch(() => {});
+    }
   }
-
-  const receiver = await db.users.findById(receiverId);
-
-  // If receiver is not registered, store as pending balance
-  if (!receiver) {
-    const username = receiverUsername?.replace(/^@/, '').toLowerCase();
-    if (!username) return { success: false, reason: 'Recipient not found. They need to /register first.' };
-
-    // Debit sender
-    const debit = await db.execute(
-      'UPDATE users SET balance_zats = balance_zats - ? WHERE telegram_id = ? AND balance_zats >= ?',
-      [amountZats, senderId, amountZats]
-    );
-    if (debit.changes === 0) return { success: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
-
-    // Store pending balance
-    await db.execute(
-      'INSERT INTO pending_balances (to_username, from_id, amount_zats, group_id, group_title, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [username, senderId, amountZats, groupId, ctx.chat.title || 'Group', Date.now()]
-    );
-    await db.syncToTurso();
-
-    return {
-      success: true,
-      pending: true,
-      username,
-      formattedAmount: wallet.formatZec(amountZats),
-    };
-  }
-
-  const { isLarge, usdValue } = await amount.checkLargeTip(BigInt(amountZats));
-  if (!isLarge) return executeTip({ senderId, receiverId, amountZats, ctx });
 
   const now = Date.now();
-  const expiresAt = now + config.security.withdrawalConfirmTimeoutSecs * 1000;
 
-  await db.confirmations.delete(senderId, 'tip');
-  await db.confirmations.insert({
-    telegram_id: senderId,
-    type: 'tip',
-    payload_json: JSON.stringify({ receiverId, amountZats, groupId, groupTitle: ctx.chat.title || 'DM' }),
-    expires_at: expiresAt,
-    created_at: now,
-  });
-
-  const usdLine = usdValue !== null ? ` (~$${usdValue.toFixed(2)})` : '';
-  const receiverName = receiver.username ? `@${receiver.username}` : receiver.first_name;
-
-  return {
-    success: true,
-    requiresConfirmation: true,
-    prompt: [
-      `⚠️ *Large Tip — Please Confirm*\n`,
-      `You're about to tip *${wallet.formatZec(amountZats)}*${usdLine}`,
-      `To: ${receiverName}\n`,
-      `Reply *YES* within ${config.security.withdrawalConfirmTimeoutSecs}s to confirm, or *NO* to cancel.`,
-    ].join('\n'),
-  };
-}
-
-async function confirmTip(senderId, ctx) {
-  const pending = await db.confirmations.get(senderId, 'tip', Date.now());
-  if (!pending) return { success: false, reason: 'No pending tip found, or it has expired. Please run /tip again.' };
-
-  await db.confirmations.delete(senderId, 'tip');
-  const { receiverId, amountZats } = JSON.parse(pending.payload_json);
-  return executeTip({ senderId, receiverId, amountZats, ctx });
-}
-
-function cancelTip(senderId) {
-  return db.confirmations.delete(senderId, 'tip');
-}
-
-async function executeTip({ senderId, receiverId, amountZats, ctx }) {
-  const groupId = String(ctx.chat.id);
-  const groupTitle = ctx.chat.title || 'DM';
-  const sender = await db.users.findById(senderId);
-  const receiver = await db.users.findById(receiverId);
-
-  const validation = await validateTip({ sender, receiver, amountZats, groupId });
-  if (!validation.valid) return { success: false, reason: validation.reason };
-
-  const memoJson = wallet.buildMemo({
-    type: 'tip',
-    fromHandle: sender.username || sender.first_name,
-    toHandle: receiver.username || receiver.first_name,
-    groupName: groupTitle,
-    communityUuid: groupId,
-  });
-
-  const tipData = {
-    from_id: senderId,
-    to_id: receiverId,
-    amount_zats: amountZats,
-    memo_json: memoJson,
+  // Register the group with default settings — no admin config required.
+  await db.groups.upsert({
     group_id: groupId,
-    group_title: groupTitle,
-    created_at: Date.now(),
-  };
+    group_title: ctx.chat.title || 'Unnamed Group',
+    min_tip_zats: config.tips.minZatoshis,
+    admin_ids: JSON.stringify([]),
+    now,
+  });
 
-  try {
-    await db.executeTip(senderId, receiverId, amountZats, tipData);
-    logger.info(`Tip: ${senderId} → ${receiverId} | ${wallet.formatZec(amountZats)} | group: ${groupId}`);
-    const updatedSender = await db.users.findById(senderId);
-    const updatedReceiver = await db.users.findById(receiverId);
-    return {
-      success: true,
-      sender: updatedSender,
-      receiver: updatedReceiver,
-      amountZats,
-      formattedAmount: wallet.formatZec(amountZats),
-    };
-  } catch (err) {
-    if (err.message === 'INSUFFICIENT_BALANCE') {
-      return { success: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
-    }
-    logger.error('Tip execution failed:', err);
-    return { success: false, reason: 'An error occurred processing your tip. Please try again.' };
+  logger.info(`Bot added to ${isNewGroup ? 'new' : 'existing'} group: ${ctx.chat.title} (${groupId})`);
+
+  await replyMd(ctx, [
+    `${'🛡️'} *${config.community.name} is here!*`,
+    ``,
+    `Private, shielded ZEC tipping — no setup needed.`,
+    ``,
+    `*Get started:*`,
+    `• /register — create your wallet`,
+    `• /tip @user 0.001 — tip someone`,
+    `• /help — see everything I can do`,
+    ``,
+    `_Group admins: if you'd rather not have this bot here, just remove it — no data is kept that's specific to this group beyond tip history and settings._`,
+  ].join('\n'));
+});
+
+// ─── /credit (bot owner only — manual deposit credit) ────────────────────────
+
+bot.command('credit', async (ctx) => {
+  if (ctx.chat.type !== 'private') return;
+  if (!config.telegram.ownerId || telegramId(ctx) !== config.telegram.ownerId) return;
+
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  if (args.length < 3) {
+    return replyMd(ctx, [
+      `*Manual Deposit Credit*`,
+      ``,
+      `Usage: /credit <telegram_id> <txid> <amount_zec>`,
+      `Example: /credit 123456789 abc123... 0.5`,
+      ``,
+      `_Use this to manually credit a deposit that the scanner missed._`,
+    ].join('\n'));
   }
-}
 
-async function executeRain({ senderId, totalAmountZats, numRecipients, ctx }) {
+  const [targetId, txid, amountStr] = args;
+  const user = await db.users.findById(targetId);
+  if (!user) return replyMd(ctx, `❌ User ${targetId} not found.`);
+
+  let amountZats;
+  try {
+    amountZats = Number(wallet.zecToZats(amountStr));
+    if (!amountZats || amountZats <= 0) throw new Error('invalid');
+  } catch {
+    return replyMd(ctx, '❌ Invalid amount.');
+  }
+
+  // Check if this txid has already been credited
+  const existing = await db.execute(
+    'SELECT id FROM deposits WHERE telegram_id = ? AND txid = ?',
+    [targetId, txid]
+  ).then(r => r.rows[0]);
+
+  if (existing) {
+    return replyMd(ctx, `❌ This transaction has already been credited to @${user.username || targetId}.`);
+  }
+
+  await db.execute(
+    'UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?',
+    [amountZats, targetId]
+  );
+  await db.execute(
+    'INSERT INTO deposits (telegram_id, txid, amount_zats, block_height, credited_at) VALUES (?, ?, ?, 0, ?)',
+    [targetId, txid, amountZats, Date.now()]
+  );
+  await db.syncToTurso();
+
+  const updated = await db.users.findById(targetId);
+  return replyMd(ctx, [
+    `✅ *Manual credit applied*`,
+    ``,
+    `User: @${user.username || targetId}`,
+    `Amount: *${wallet.formatZec(amountZats)}*`,
+    `New balance: *${wallet.formatZec(updated.balance_zats)}*`,
+  ].join('\n'));
+});
+
+bot.command('stats_global', async (ctx) => {
+  if (ctx.chat.type !== 'private') {
+    return; // silently ignore in groups — don't leak that this command exists
+  }
+  if (!config.telegram.ownerId || telegramId(ctx) !== config.telegram.ownerId) {
+    return; // silently ignore for non-owners
+  }
+
+  const [gc, uc, tc, tt, wc] = await Promise.all([
+    db.execute('SELECT COUNT(*) as c FROM group_settings').then(r => r.rows[0].c),
+    db.execute('SELECT COUNT(*) as c FROM users').then(r => r.rows[0].c),
+    db.execute('SELECT COUNT(*) as c FROM tips').then(r => r.rows[0].c),
+    db.execute('SELECT COALESCE(SUM(amount_zats),0) as s FROM tips').then(r => r.rows[0].s),
+    db.execute("SELECT COUNT(*) as c FROM withdrawals WHERE status = 'broadcast'").then(r => r.rows[0].c),
+  ]);
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const activeGroups7d = await db.execute('SELECT COUNT(DISTINCT group_id) as c FROM tips WHERE created_at >= ?', [sevenDaysAgo]).then(r => r.rows[0].c);
+  const [groupCount, userCount, tipCount, totalTipped, withdrawalCount] = [gc, uc, tc, tt, wc];
+
+  return replyMd(ctx, [
+    `📊 *Global Bot Stats*`,
+    ``,
+    `Groups: *${groupCount}* (${activeGroups7d} active in last 7d)`,
+    `Registered users: *${userCount}*`,
+    `Total tips sent: *${tipCount}*`,
+    `Total volume: *${wallet.formatZec(totalTipped)}*`,
+    `Withdrawals broadcast: *${withdrawalCount}*`,
+  ].join('\n'));
+});
+
+// ─── /leave (group admins or bot owner only) ─────────────────────────────────
+
+bot.command('leave', async (ctx) => {
+  if (ctx.chat.type === 'private') {
+    return replyMd(ctx, '❌ This command only works inside a group.');
+  }
+
+  const isOwner = config.telegram.ownerId && telegramId(ctx) === config.telegram.ownerId;
+  let isAdmin = isOwner;
+
+  if (!isAdmin) {
+    const member = await ctx.getChatMember(ctx.from.id).catch(() => null);
+    isAdmin = member && ['administrator', 'creator'].includes(member.status);
+  }
+
+  if (!isAdmin) {
+    return replyMd(ctx, '❌ Only group admins can remove the bot.');
+  }
+
+  await replyMd(ctx, '👋 Leaving this group. Thanks for having me!');
+  return ctx.leaveChat();
+});
+
+// ─── /start & /help ──────────────────────────────────────────────────────────
+
+bot.start(async (ctx) => {
+  await replyMd(ctx, messages.helpMessage());
+});
+
+bot.help(async (ctx) => {
+  await replyMd(ctx, messages.helpMessage());
+});
+
+bot.command('help', async (ctx) => {
+  await replyMd(ctx, messages.helpMessage());
+});
+
+// ─── /register ───────────────────────────────────────────────────────────────
+
+bot.command('register', async (ctx) => {
+  const id = telegramId(ctx);
+  const existing = await db.users.findById(id);
+
+  if (existing) {
+    return replyMd(ctx, messages.alreadyRegistered(existing));
+  }
+
+  const rateLimitOk = await checkRegisterLimit(id);
+  if (!rateLimitOk) {
+    return replyMd(ctx, '⚠️ Please wait a few minutes before registering again.');
+  }
+
+  // Derive next diversifier index
+  const maxResult = await db.users.getMaxDivIndex();
+  const nextDivIndex = (maxResult.max_idx ?? -1) + 1;
+
+  // Derive unique u1... address
+  let uaAddress;
+  try {
+    uaAddress = await wallet.deriveAddress(nextDivIndex);
+  } catch (err) {
+    logger.error('Address derivation failed:', err);
+    return replyMd(ctx, '❌ Registration failed. Please try again or contact an admin.');
+  }
+
+  // Store user
+  try {
+    await db.users.create({
+      telegram_id: id,
+      username: ctx.from.username?.toLowerCase() || null,
+      first_name: ctx.from.first_name || null,
+      div_index: nextDivIndex,
+      ua_address: uaAddress,
+      registered_at: Date.now(),
+    });
+  } catch (err) {
+    logger.error('User creation failed:', err);
+    return replyMd(ctx, '❌ Registration failed. Please try again.');
+  }
+
+  logger.info(`New user registered: ${id} (@${ctx.from.username}) | div_index: ${nextDivIndex}`);
+
+  // Claim any pending balances sent to this username before registration
+  const username = ctx.from.username?.toLowerCase();
+  let pendingTotal = 0;
+  if (username) {
+    const pending = await db.execute(
+      'SELECT SUM(amount_zats) as total FROM pending_balances WHERE to_username = ?',
+      [username]
+    ).then(r => r.rows[0]);
+
+    if (pending?.total > 0) {
+      pendingTotal = pending.total;
+      await db.execute(
+        'UPDATE users SET balance_zats = balance_zats + ? WHERE telegram_id = ?',
+        [pendingTotal, id]
+      );
+      await db.execute(
+        'DELETE FROM pending_balances WHERE to_username = ?',
+        [username]
+      );
+      await db.syncToTurso();
+      logger.info(`Claimed ${wallet.formatZec(pendingTotal)} pending balance for @${username}`);
+    }
+  }
+
+  const welcomeMsg = messages.welcome(ctx.from, uaAddress);
+  if (pendingTotal > 0) {
+    return replyMd(ctx, welcomeMsg + `\n\n🎉 You had *${wallet.formatZec(pendingTotal)}* waiting for you from tips sent before you registered!`);
+  }
+  return replyMd(ctx, welcomeMsg);
+});
+
+// ─── /address ────────────────────────────────────────────────────────────────
+
+bot.command('address', async (ctx) => {
+  const user = await db.users.findById(telegramId(ctx));
+  if (!user) return replyMd(ctx, '❌ You are not registered. Use /register to get started.');
+
+  return replyMd(ctx, [
+    `📬 *Your Deposit Address*`,
+    ``,
+    `\`${user.ua_address}\``,
+    ``,
+    `_Unified Address (ZIP-316) — Orchard shielded pool_`,
+    `_Send ZEC here to top up your balance._`,
+  ].join('\n'));
+});
+
+// ─── /balance ────────────────────────────────────────────────────────────────
+
+bot.command('balance', async (ctx) => {
+  const user = await db.users.findById(telegramId(ctx));
+  if (!user) return replyMd(ctx, '❌ You are not registered. Use /register to get started.');
+
+  return replyMd(ctx, messages.balanceMessage(user));
+});
+
+// ─── /tip ────────────────────────────────────────────────────────────────────
+
+bot.command('tip', async (ctx) => {
+  const id = telegramId(ctx);
+  const args = ctx.message.text.split(/\s+/).slice(1);
+
+  // Rate limit check
+  const allowed = await checkTipLimit(id);
+  if (!allowed) {
+    return replyMd(ctx, `⚠️ You're tipping too fast. Max ${config.security.tipRateLimitPerMinute} tips per minute.`);
+  }
+
+  let targetUsername = null;
+  let amountStr = null;
+
+  // Parse: /tip @username 0.001 | /tip @username $5 | /tip @username 5 usd
+  //     or: /tip 0.001 (reply)  | /tip $5 (reply)    | /tip 5 usd (reply)
+  if (args.length >= 1 && args[0].startsWith('@')) {
+    targetUsername = args[0];
+    amountStr = args.slice(1).join(' '); // supports "5 usd" as two tokens
+  } else if (args.length >= 1) {
+    amountStr = args.join(' ');
+  }
+
+  if (targetUsername && !amountStr) {
+    return replyMd(ctx, '❌ Usage: /tip @username 0.001 or reply to a message with /tip 0.001\nUSD also works: /tip @username $5');
+  }
+
+  let parsed;
+  try {
+    parsed = await amount.parseAmount(amountStr);
+  } catch (err) {
+    if (err.message === 'PRICE_UNAVAILABLE') {
+      return replyMd(ctx, '❌ Could not fetch the current ZEC price for your USD amount. Please try again shortly, or use a ZEC amount instead.');
+    }
+    throw err;
+  }
+
+  if (!parsed) {
+    return replyMd(ctx, '❌ Invalid amount. Example: /tip @username 0.001  or  /tip @username $5');
+  }
+
+  const amountZats = Number(parsed.amountZats);
+
+  const sender = await db.users.findById(id);
+  if (!sender) return replyMd(ctx, '❌ You are not registered. Use /register first.');
+
+  // Try to resolve receiver — may be null if not registered
+  const receiver = await tips.resolveTarget(ctx, targetUsername);
+
+  // If no receiver found and it's a reply-tip (no username), we can't identify them
+  if (!receiver && !targetUsername) {
+    return replyMd(ctx, '❌ User not found. They need to /register first.');
+  }
+
+  const result = await tips.initiateTip({
+    senderId: id,
+    receiverId: receiver?.telegram_id || null,
+    receiverUsername: targetUsername,
+    amountZats,
+    ctx,
+  });
+
+  if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+  if (result.requiresConfirmation) return replyMd(ctx, result.prompt);
+
+  // Pending tip — recipient not yet registered
+  if (result.pending) {
+    return replyMd(ctx, [
+      `✅ *Tip queued!*`,
+      ``,
+      `*${result.formattedAmount}* is being held for @${result.username}.`,
+      `They'll receive it automatically when they /register.`,
+    ].join('\n'));
+  }
+
+  return replyMd(ctx, messages.tipSuccess(result.sender, result.receiver, result.amountZats));
+});
+
+// ─── /rain ───────────────────────────────────────────────────────────────────
+
+bot.command('rain', async (ctx) => {
+  const id = telegramId(ctx);
+  const args = ctx.message.text.split(/\s+/).slice(1);
+
+  if (args.length < 2) {
+    return replyMd(ctx, '❌ Usage: /rain <amount> <number_of_users>\nExample: /rain 0.05 5');
+  }
+
+  const amountZats = parseAmount(args[0]);
+  const numRecipients = parseInt(args[1], 10);
+
+  if (!amountZats) return replyMd(ctx, '❌ Invalid amount. Example: /rain 0.05 5');
+  if (!numRecipients || numRecipients < 1) return replyMd(ctx, '❌ Invalid number of users.');
+
+  const result = await tips.executeRain({ senderId: id, totalAmountZats: amountZats, numRecipients, ctx });
+
+  if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+  return replyMd(ctx, messages.rainSuccess(result));
+});
+
+// ─── /withdraw ───────────────────────────────────────────────────────────────
+
+bot.command('withdraw', async (ctx) => {
+  const id = telegramId(ctx);
+  const args = ctx.message.text.split(/\s+/).slice(1);
+
+  if (args.length < 2) {
+    return replyMd(ctx, [
+      `❌ Usage: /withdraw <address> <amount>`,
+      `Example: /withdraw u1abc...xyz 0.05`,
+      `USD also works: /withdraw u1abc...xyz $5`,
+      ``,
+      `⚠️ Only Unified Addresses (u1...) are accepted.`,
+    ].join('\n'));
+  }
+
+  const toAddress = args[0];
+  const amountInput = args.slice(1).join(' '); // supports "5 usd" as two tokens
+
+  const result = await withdraw.initiateWithdrawal({ telegramId: id, toAddress, amountInput });
+
+  if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+  if (result.requiresConfirmation) return replyMd(ctx, result.prompt);
+});
+
+// ─── YES/NO confirmation handler ─────────────────────────────────────────────
+
+bot.hears(/^(YES|NO|yes|no)$/i, async (ctx) => {
+  const id = telegramId(ctx);
+  const response = ctx.message.text.toUpperCase();
+  const now = Date.now();
+
+  // Check for either kind of pending confirmation — withdrawal or large tip.
+  // Whichever was created more recently wins if (improbably) both are pending.
+  const [pendingWithdrawal, pendingTip] = await Promise.all([
+    db.confirmations.get(id, 'withdrawal', now),
+    db.confirmations.get(id, 'tip', now),
+  ]);
+
+  if (!pendingWithdrawal && !pendingTip) return; // Not a confirmation context, ignore
+
+  const isTip = pendingTip && (!pendingWithdrawal || pendingTip.created_at > pendingWithdrawal.created_at);
+
+  if (response === 'NO') {
+    if (isTip) {
+      tips.cancelTip(id);
+      return replyMd(ctx, '❌ Tip cancelled.');
+    }
+    withdraw.cancelWithdrawal(id);
+    return replyMd(ctx, '❌ Withdrawal cancelled.');
+  }
+
+  if (response === 'YES') {
+    if (isTip) {
+      const result = await tips.confirmTip(id, ctx);
+      if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+      return replyMd(ctx, messages.tipSuccess(result.sender, result.receiver, result.amountZats));
+    }
+    const result = await withdraw.confirmWithdrawal(id);
+    if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+    return replyMd(ctx, messages.withdrawSuccess(result));
+  }
+});
+
+// ─── /history ────────────────────────────────────────────────────────────────
+
+bot.command('history', async (ctx) => {
+  const id = telegramId(ctx);
+  const user = await db.users.findById(id);
+  if (!user) return replyMd(ctx, '❌ You are not registered. Use /register first.');
+
+  const history = await tips.getTipHistory(id);
+  return replyMd(ctx, messages.historyMessage(id, history));
+});
+
+// ─── /stats ──────────────────────────────────────────────────────────────────
+
+bot.command('stats', async (ctx) => {
+  const id = telegramId(ctx);
+  const user = await db.users.findById(id);
+  if (!user) return replyMd(ctx, '❌ You are not registered. Use /register first.');
+
+  const userStats = await tips.getUserStats(id);
+  return replyMd(ctx, messages.statsMessage(user, userStats));
+});
+
+// ─── /leaderboard ────────────────────────────────────────────────────────────
+
+bot.command('leaderboard', async (ctx) => {
+  if (ctx.chat.type === 'private') {
+    return replyMd(ctx, '❌ Leaderboard is only available in group chats.');
+  }
+
   const groupId = String(ctx.chat.id);
+  const groupTitle = ctx.chat.title || 'This Group';
   const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
 
-  const sender = await db.users.findById(senderId);
-  if (!sender) return { success: false, reason: 'You are not registered. Use /register first.' };
-  if (numRecipients < 1 || numRecipients > config.tips.rainMaxUsers) {
-    return { success: false, reason: `Rain recipients must be between 1 and ${config.tips.rainMaxUsers}.` };
+  const [topTippers, topReceivers] = await Promise.all([
+    db.users.getTopTippers(groupId, thirtyDaysAgo),
+    db.users.getTopReceivers(groupId, thirtyDaysAgo),
+  ]);
+
+  return replyMd(ctx, messages.leaderboard(topTippers, topReceivers, groupTitle));
+});
+
+// ─── /setmintip (admin only) ──────────────────────────────────────────────────
+
+bot.command('setmintip', async (ctx) => {
+  if (ctx.chat.type === 'private') {
+    return replyMd(ctx, '❌ This command is only for group admins.');
   }
 
-  const recentUsers = (await db.users.getRecentActiveInGroup(groupId, thirtyDaysAgo, numRecipients + 5))
-    .filter(u => u.telegram_id !== senderId)
-    .slice(0, numRecipients);
+  // Verify admin
+  const member = await ctx.getChatMember(ctx.from.id).catch(() => null);
+  const isAdmin = member && ['administrator', 'creator'].includes(member.status);
+  if (!isAdmin) return replyMd(ctx, '❌ Only group admins can set the minimum tip.');
 
-  if (recentUsers.length === 0) return { success: false, reason: 'No recent active users found in this group.' };
-
-  const actualN = recentUsers.length;
-  const perUserZats = Math.floor(totalAmountZats / actualN);
-
-  if (perUserZats < config.tips.minZatoshis) {
-    return { success: false, reason: `Each rain share (${wallet.formatZec(perUserZats)}) is below the minimum tip amount.` };
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const amountZats = parseAmount(args[0]);
+  if (!amountZats || amountZats < 1000) {
+    return replyMd(ctx, '❌ Invalid amount. Minimum is 0.00001 ZEC (1000 zatoshis).');
   }
 
-  const totalNeeded = perUserZats * actualN;
-  if (BigInt(sender.balance_zats) < BigInt(totalNeeded)) {
-    return { success: false, reason: `Insufficient balance. Need ${wallet.formatZec(totalNeeded)}, have ${wallet.formatZec(sender.balance_zats)}.` };
-  }
-
-  const groupTitle = ctx.chat.title || 'Group';
+  const groupId = String(ctx.chat.id);
   const now = Date.now();
-  const tippedUsers = [];
 
-  try {
-    for (const recipient of recentUsers) {
-      const memoJson = wallet.buildMemo({
-        type: 'rain',
-        fromHandle: sender.username || sender.first_name,
-        toHandle: recipient.username || recipient.first_name,
-        groupName: groupTitle,
-        communityUuid: groupId,
-      });
-      await db.executeTip(senderId, recipient.telegram_id, perUserZats, {
-        from_id: senderId,
-        to_id: recipient.telegram_id,
-        amount_zats: perUserZats,
-        memo_json: memoJson,
-        group_id: groupId,
-        group_title: groupTitle,
-        created_at: now,
-      });
-      tippedUsers.push(recipient);
-    }
-    logger.info(`Rain: ${senderId} → ${actualN} users | ${wallet.formatZec(perUserZats)} each | group: ${groupId}`);
-    return { success: true, tippedUsers, perUserZats, totalZats: totalNeeded };
-  } catch (err) {
-    logger.error('Rain execution failed:', err);
-    return { success: false, reason: 'Rain failed. Please try again.' };
-  }
-}
+  await db.groups.upsert({
+    group_id: groupId,
+    group_title: ctx.chat.title,
+    min_tip_zats: amountZats,
+    admin_ids: JSON.stringify([String(ctx.from.id)]),
+    now,
+  });
 
-async function getTipHistory(telegramId) {
-  const tipList = await db.tips.getHistory(telegramId);
-  return tipList.map(t => ({
-    ...t,
-    isSent: t.from_id === telegramId,
-    formattedAmount: wallet.formatZec(t.amount_zats),
-    date: new Date(t.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
-  }));
-}
+  return replyMd(ctx, `✅ Minimum tip set to *${wallet.formatZec(amountZats)}* for this group.`);
+});
 
-async function getUserStats(telegramId) {
-  const stats = await db.tips.getStats(telegramId);
-  return {
-    totalSent: wallet.formatZec(stats.total_sent),
-    totalReceived: wallet.formatZec(stats.total_received),
-    sentCount: stats.sent_count,
-    receivedCount: stats.received_count,
-    largestReceived: wallet.formatZec(stats.largest_received),
-  };
-}
+// ─── Error Handler ────────────────────────────────────────────────────────────
 
-module.exports = {
-  resolveTarget,
-  validateTip,
-  initiateTip,
-  confirmTip,
-  cancelTip,
-  executeTip,
-  executeRain,
-  getTipHistory,
-  getUserStats,
-};
+bot.catch((err, ctx) => {
+  logger.error(`Bot error for update ${ctx.updateType}:`, err);
+  ctx.reply('❌ An unexpected error occurred. Please try again.').catch(() => {});
+});
+
+// ─── Cron Jobs ────────────────────────────────────────────────────────────────
+
+// Clean up expired confirmations every 5 minutes
+cron.schedule('*/5 * * * *', async () => {
+  await db.confirmations.cleanExpired(Date.now());
+  logger.debug('Cleaned expired confirmations');
+});
+
+// ─── Launch ───────────────────────────────────────────────────────────────────
+
+bot.launch({
+  allowedUpdates: ['message', 'callback_query'],
+}).then(() => {
+  logger.info(`✅ ${config.community.name} is live!`);
+}).catch((err) => {
+  logger.error('Failed to launch bot:', err);
+  process.exit(1);
+});
+
+// Graceful shutdown
+process.once('SIGINT', () => {
+  logger.info('Shutting down...');
+  bot.stop('SIGINT');
+});
+process.once('SIGTERM', () => {
+  logger.info('Shutting down...');
+  bot.stop('SIGTERM');
+});
