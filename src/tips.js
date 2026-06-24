@@ -44,13 +44,46 @@ async function validateTip({ sender, receiver, amountZats, groupId }) {
   return { valid: true };
 }
 
-async function initiateTip({ senderId, receiverId, amountZats, ctx }) {
+async function initiateTip({ senderId, receiverId, receiverUsername, amountZats, ctx }) {
   const groupId = String(ctx.chat.id);
   const sender = await db.users.findById(senderId);
+  if (!sender) return { success: false, reason: 'You are not registered. Use /register first.' };
+
+  const groupSettings = await db.groups.get(groupId);
+  const minTip = groupSettings?.min_tip_zats ?? config.tips.minZatoshis;
+  if (amountZats < minTip) return { success: false, reason: `Minimum tip is ${wallet.formatZec(minTip)}.` };
+  if (BigInt(sender.balance_zats) < BigInt(amountZats)) {
+    return { success: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
+  }
+
   const receiver = await db.users.findById(receiverId);
 
-  const validation = await validateTip({ sender, receiver, amountZats, groupId });
-  if (!validation.valid) return { success: false, reason: validation.reason };
+  // If receiver is not registered, store as pending balance
+  if (!receiver) {
+    const username = receiverUsername?.replace(/^@/, '').toLowerCase();
+    if (!username) return { success: false, reason: 'Recipient not found. They need to /register first.' };
+
+    // Debit sender
+    const debit = await db.execute(
+      'UPDATE users SET balance_zats = balance_zats - ? WHERE telegram_id = ? AND balance_zats >= ?',
+      [amountZats, senderId, amountZats]
+    );
+    if (debit.changes === 0) return { success: false, reason: `Insufficient balance. Your balance: ${wallet.formatZec(sender.balance_zats)}.` };
+
+    // Store pending balance
+    await db.execute(
+      'INSERT INTO pending_balances (to_username, from_id, amount_zats, group_id, group_title, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [username, senderId, amountZats, groupId, ctx.chat.title || 'Group', Date.now()]
+    );
+    await db.syncToTurso();
+
+    return {
+      success: true,
+      pending: true,
+      username,
+      formattedAmount: wallet.formatZec(amountZats),
+    };
+  }
 
   const { isLarge, usdValue } = await amount.checkLargeTip(BigInt(amountZats));
   if (!isLarge) return executeTip({ senderId, receiverId, amountZats, ctx });
