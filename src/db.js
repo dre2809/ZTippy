@@ -156,6 +156,18 @@ async function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_deposits_telegram_id ON deposits(telegram_id);
     CREATE INDEX IF NOT EXISTS idx_deposits_txid ON deposits(txid)`,
+
+    // v4: Pending balances — tips sent to unregistered users (stored by username)
+    `CREATE TABLE IF NOT EXISTS pending_balances (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      to_username   TEXT NOT NULL,
+      from_id       TEXT NOT NULL,
+      amount_zats   INTEGER NOT NULL,
+      group_id      TEXT,
+      group_title   TEXT,
+      created_at    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_balances_username ON pending_balances(to_username)`,
   ];
 
   const result = await execute('SELECT MAX(version) as v FROM schema_versions');
