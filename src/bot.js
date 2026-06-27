@@ -465,27 +465,239 @@ bot.command('rain', async (ctx) => {
 
 // ─── /withdraw ───────────────────────────────────────────────────────────────
 
+const intents = require('./intents');
+
+// In-memory store for multi-step intent withdrawal state
+const intentState = new Map();
+
 bot.command('withdraw', async (ctx) => {
   const id = telegramId(ctx);
-  const args = ctx.message.text.split(/\s+/).slice(1);
+  const user = await db.users.findById(id);
+  if (!user) return replyMd(ctx, '❌ You are not registered. Use /register first.');
+  if (!user.balance_zats || user.balance_zats <= 0) return replyMd(ctx, '❌ Your balance is 0. Deposit ZEC first.');
 
-  if (args.length < 2) {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  if (!args[0]) {
     return replyMd(ctx, [
-      `❌ Usage: /withdraw <address> <amount>`,
-      `Example: /withdraw u1abc...xyz 0.05`,
-      `USD also works: /withdraw u1abc...xyz $5`,
+      `💸 *Withdraw ZEC*\n`,
+      `Usage: /withdraw <amount>`,
+      `Example: /withdraw 0.05`,
       ``,
-      `⚠️ Only Unified Addresses (u1...) are accepted.`,
+      `You will be asked where to send it.`,
     ].join('\n'));
   }
 
-  const toAddress = args[0];
-  const amountInput = args.slice(1).join(' '); // supports "5 usd" as two tokens
+  const amountInput = args.join(' ');
+  let parsed;
+  try {
+    parsed = await amount.parseAmount(amountInput);
+  } catch (err) {
+    if (err.message === 'PRICE_UNAVAILABLE') return replyMd(ctx, '❌ Could not fetch ZEC price. Use a ZEC amount instead.');
+    throw err;
+  }
+  if (!parsed) return replyMd(ctx, '❌ Invalid amount. Example: /withdraw 0.05');
 
-  const result = await withdraw.initiateWithdrawal({ telegramId: id, toAddress, amountInput });
+  const amountZats = Number(parsed.amountZats);
+  if (amountZats > user.balance_zats) return replyMd(ctx, `❌ Insufficient balance. Your balance: ${wallet.formatZec(user.balance_zats)}`);
 
-  if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
-  if (result.requiresConfirmation) return replyMd(ctx, result.prompt);
+  // Store amount and ask destination type
+  intentState.set(id, { step: 'type', amountZats });
+
+  await ctx.reply('💸 *Where do you want to withdraw?*', {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🛡 Zcash Address (ZEC)', callback_data: 'wd_type_zec' }],
+        [{ text: '🌐 Swap to Another Token', callback_data: 'wd_type_swap' }],
+      ],
+    },
+  });
+});
+
+// Step 1 — Type selection
+bot.action('wd_type_zec', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = String(ctx.from.id);
+  const state = intentState.get(id);
+  if (!state) return ctx.reply('Session expired. Please run /withdraw again.');
+
+  intentState.set(id, { ...state, step: 'zec_address' });
+  await ctx.editMessageText(
+    `🛡 *Withdraw to Zcash Address*\n\nAmount: *${wallet.formatZec(state.amountZats)}*\n\nPlease send your Unified Address (u1...):`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.action('wd_type_swap', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = String(ctx.from.id);
+  const state = intentState.get(id);
+  if (!state) return ctx.reply('Session expired. Please run /withdraw again.');
+
+  intentState.set(id, { ...state, step: 'chain' });
+
+  const chains = Object.entries(intents.CHAIN_LABELS).map(([key, label]) => ([
+    { text: label, callback_data: `wd_chain_${key}` },
+  ]));
+
+  await ctx.editMessageText(
+    `🌐 *Select destination chain:*\n\nAmount: *${wallet.formatZec(state.amountZats)}*`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: chains },
+    }
+  );
+});
+
+// Step 2 — Chain selection
+Object.keys(intents.CHAIN_LABELS).forEach(chain => {
+  bot.action(`wd_chain_${chain}`, async (ctx) => {
+    await ctx.answerCbQuery();
+    const id = String(ctx.from.id);
+    const state = intentState.get(id);
+    if (!state) return ctx.reply('Session expired. Please run /withdraw again.');
+
+    intentState.set(id, { ...state, step: 'token', chain });
+
+    const tokens = Object.keys(intents.SUPPORTED_TOKENS[chain]).map(symbol => ([
+      { text: symbol, callback_data: `wd_token_${chain}_${symbol}` },
+    ]));
+
+    await ctx.editMessageText(
+      `${intents.CHAIN_LABELS[chain]} — *Select token:*`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: tokens },
+      }
+    );
+  });
+});
+
+// Step 3 — Token selection
+Object.entries(intents.SUPPORTED_TOKENS).forEach(([chain, tokens]) => {
+  Object.keys(tokens).forEach(symbol => {
+    bot.action(`wd_token_${chain}_${symbol}`, async (ctx) => {
+      await ctx.answerCbQuery();
+      const id = String(ctx.from.id);
+      const state = intentState.get(id);
+      if (!state) return ctx.reply('Session expired. Please run /withdraw again.');
+
+      intentState.set(id, { ...state, step: 'address', token: symbol });
+
+      await ctx.editMessageText(
+        `*${symbol}* on ${intents.CHAIN_LABELS[chain]}\n\nPlease send your *${symbol} destination address*:`,
+        { parse_mode: 'Markdown' }
+      );
+    });
+  });
+});
+
+// Step 4 — Address input (text handler)
+bot.on('text', async (ctx, next) => {
+  const id = String(ctx.from.id);
+  const state = intentState.get(id);
+  if (!state) return next();
+
+  const text = ctx.message.text.trim();
+  if (text.startsWith('/')) return next(); // ignore commands
+
+  // ZEC address flow
+  if (state.step === 'zec_address') {
+    intentState.delete(id);
+    const toAddress = text;
+    const amountInput = String(state.amountZats / 1e8);
+    const result = await withdraw.initiateWithdrawal({ telegramId: id, toAddress, amountInput });
+    if (!result.success) return replyMd(ctx, `❌ ${result.reason}`);
+    if (result.requiresConfirmation) return replyMd(ctx, result.prompt);
+    return;
+  }
+
+  // NEAR Intents swap flow — waiting for destination address
+  if (state.step === 'address') {
+    intentState.set(id, { ...state, step: 'confirming', recipient: text });
+
+    await replyMd(ctx, `⏳ Fetching quote...`);
+
+    try {
+      const user = await db.users.findById(id);
+      const quote = await intents.getSwapQuote({
+        amountZats: state.amountZats,
+        chain: state.chain,
+        token: state.token,
+        recipient: text,
+        refundAddress: user.ua_address,
+      });
+
+      intentState.set(id, { ...state, step: 'confirmed', recipient: text, quote });
+
+      await ctx.reply(
+        intents.formatQuote(quote, state.amountZats) + `\n\nSend *YES* to confirm or *NO* to cancel.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '✅ Confirm', callback_data: 'wd_intent_confirm' },
+              { text: '❌ Cancel', callback_data: 'wd_intent_cancel' },
+            ]],
+          },
+        }
+      );
+    } catch (err) {
+      intentState.delete(id);
+      logger.error('Intent quote error:', err.message);
+      return replyMd(ctx, `❌ Could not get swap quote: ${err.message}`);
+    }
+    return;
+  }
+
+  return next();
+});
+
+// Step 5 — Confirm/cancel swap
+bot.action('wd_intent_confirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = String(ctx.from.id);
+  const state = intentState.get(id);
+  if (!state?.quote) return ctx.reply('Session expired. Please run /withdraw again.');
+
+  intentState.delete(id);
+
+  // Debit user balance
+  const user = await db.users.findById(id);
+  if (user.balance_zats < state.amountZats) {
+    return replyMd(ctx, '❌ Insufficient balance.');
+  }
+
+  await db.execute('UPDATE users SET balance_zats = balance_zats - ? WHERE telegram_id = ?', [state.amountZats, id]);
+  await db.execute(
+    'INSERT INTO withdrawals (telegram_id, to_address, amount_zats, fee_zats, status, created_at) VALUES (?, ?, ?, 0, ?, ?)',
+    [id, state.quote.depositAddress, state.amountZats, 'intent_pending', Date.now()]
+  );
+  await db.syncToTurso();
+
+  await ctx.editMessageText(
+    [
+      `✅ *Swap initiated via NEAR Intents!*\n`,
+      `Send *${wallet.formatZec(state.amountZats)}* to:`,
+      `\`${state.quote.depositAddress}\``,
+      ``,
+      `Your ${state.token} will arrive at:`,
+      `\`${state.quote.recipient}\``,
+      ``,
+      `Expected: *${state.quote.amountOutFormatted} ${state.token}*`,
+      `Est. time: ~${Math.ceil(state.quote.timeEstimate / 60)} min`,
+      ``,
+      `If the swap fails, ZEC is automatically refunded to your tipbot address.`,
+    ].join('\n'),
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.action('wd_intent_cancel', async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = String(ctx.from.id);
+  intentState.delete(id);
+  await ctx.editMessageText('❌ Swap cancelled.');
 });
 
 // ─── YES/NO confirmation handler ─────────────────────────────────────────────
